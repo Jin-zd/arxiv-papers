@@ -1,2 +1,5 @@
+from arxiv_papers.cli import app
+
+
 def main() -> None:
-    print("Hello from arxiv-papers!")
+    app()
