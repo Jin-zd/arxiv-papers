@@ -22,6 +22,7 @@ from arxiv_papers.metadata import (
     parse_oai_record,
 )
 from arxiv_papers.oai import OAIClient, OAIPage, OAIProtocolError
+from arxiv_papers.progress import ProgressDisplay
 from arxiv_papers.state import SyncStateStore, overlap_datestamp
 from arxiv_papers.storage import (
     DuckDBSnapshotBuilder,
@@ -87,6 +88,7 @@ class FullSyncRunner:
         snapshot_builder: DuckDBSnapshotBuilder | None = None,
         state_store: SyncStateStore | None = None,
         overlap_days: int = 3,
+        progress: ProgressDisplay | None = None,
     ) -> None:
         if overlap_days < 0:
             raise ValueError("overlap_days must be non-negative")
@@ -98,6 +100,7 @@ class FullSyncRunner:
             self.data_dir / "state" / "sync.duckdb"
         )
         self.overlap_days = overlap_days
+        self.progress = progress
 
     def run(
         self,
@@ -146,6 +149,8 @@ class FullSyncRunner:
                 "next_page": context.next_page,
             },
         )
+        if self.progress is not None:
+            self.progress.start()
         next_page = context.next_page
         try:
             should_fetch = (
@@ -225,9 +230,13 @@ class FullSyncRunner:
                 snapshot=snapshot,
                 resumed=context.resumed,
             )
+            if self.progress is not None:
+                self.progress.finish(success=True)
             LOGGER.info("full_sync_finished", extra=result.as_dict())
             return result
         except Exception as error:
+            if self.progress is not None:
+                self.progress.finish(success=False)
             self.state_store.mark_failed(run_id=context.run_id, error=str(error))
             if not isinstance(error, MetadataParseError):
                 self.state_store.record_dead_letter(
@@ -255,7 +264,14 @@ class FullSyncRunner:
         if not hasattr(client_pages, "__iter__"):
             raise TypeError("client_pages must be iterable")
         page_number = start_page
-        for page in client_pages:
+        page_iterator = iter(client_pages)
+        while True:
+            if self.progress is not None:
+                self.progress.requesting(page_number=page_number)
+            try:
+                page = next(page_iterator)
+            except StopIteration:
+                break
             stats.pages += 1
             stats.records += len(page.records)
             request_params = dict(page.request_params)
@@ -308,6 +324,8 @@ class FullSyncRunner:
                     "next_resumption_token": bool(page.resumption_token),
                 },
             )
+            if self.progress is not None:
+                self.progress.update(page, page_number=page_number)
             page_number += 1
         return page_number
 
@@ -458,6 +476,8 @@ class IncrementalSyncRunner(FullSyncRunner):
         parquet_root = self.data_dir / "parquet" / "incremental" / context.run_id
         store = ParquetBatchStore(parquet_root)
         run_date = datetime.now(UTC).date()
+        if self.progress is not None:
+            self.progress.start()
         next_page = context.next_page
         try:
             should_fetch = (
@@ -530,6 +550,8 @@ class IncrementalSyncRunner(FullSyncRunner):
                 snapshot_path=snapshot.path,
                 sync_name="incremental",
             )
+            if self.progress is not None:
+                self.progress.finish(success=True)
             return FullSyncResult(
                 run_id=context.run_id,
                 stats=stats,
@@ -538,6 +560,8 @@ class IncrementalSyncRunner(FullSyncRunner):
                 resumed=context.resumed,
             )
         except Exception as error:
+            if self.progress is not None:
+                self.progress.finish(success=False)
             self.state_store.mark_failed(
                 run_id=context.run_id, error=str(error), sync_name="incremental"
             )

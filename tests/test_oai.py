@@ -54,7 +54,7 @@ def make_config(**overrides: object) -> OAIClientConfig:
 
 @respx.mock
 def test_list_records_follows_resumption_token_and_parses_records() -> None:
-    route = respx.get("https://export.arxiv.org/oai2").mock(
+    route = respx.get("https://oaipmh.arxiv.org/oai").mock(
         side_effect=[
             httpx.Response(200, content=PAGE_ONE),
             httpx.Response(200, content=PAGE_TWO),
@@ -88,7 +88,7 @@ def test_list_records_follows_resumption_token_and_parses_records() -> None:
 
 @respx.mock
 def test_can_resume_from_an_existing_token() -> None:
-    route = respx.get("https://export.arxiv.org/oai2").mock(
+    route = respx.get("https://oaipmh.arxiv.org/oai").mock(
         return_value=httpx.Response(200, content=PAGE_TWO)
     )
 
@@ -104,7 +104,7 @@ def test_can_resume_from_an_existing_token() -> None:
 
 @respx.mock
 def test_retries_transient_http_status() -> None:
-    route = respx.get("https://export.arxiv.org/oai2").mock(
+    route = respx.get("https://oaipmh.arxiv.org/oai").mock(
         side_effect=[
             httpx.Response(503, text="busy"),
             httpx.Response(200, content=PAGE_TWO),
@@ -120,7 +120,7 @@ def test_retries_transient_http_status() -> None:
 
 @respx.mock
 def test_raises_http_error_for_non_retryable_status() -> None:
-    respx.get("https://export.arxiv.org/oai2").mock(
+    respx.get("https://oaipmh.arxiv.org/oai").mock(
         return_value=httpx.Response(400, text="bad request")
     )
 
@@ -133,7 +133,7 @@ def test_raises_http_error_for_non_retryable_status() -> None:
 @respx.mock
 def test_raises_protocol_error() -> None:
     body = b"""<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"><error code="badResumptionToken">expired</error></OAI-PMH>"""
-    respx.get("https://export.arxiv.org/oai2").mock(
+    respx.get("https://oaipmh.arxiv.org/oai").mock(
         return_value=httpx.Response(200, content=body)
     )
 
@@ -146,7 +146,7 @@ def test_raises_protocol_error() -> None:
 
 @respx.mock
 def test_rejects_malformed_xml() -> None:
-    respx.get("https://export.arxiv.org/oai2").mock(
+    respx.get("https://oaipmh.arxiv.org/oai").mock(
         return_value=httpx.Response(200, content=b"<not-xml")
     )
 
@@ -156,7 +156,7 @@ def test_rejects_malformed_xml() -> None:
 
 @respx.mock
 def test_exhausted_transport_retries_raise_client_error() -> None:
-    respx.get("https://export.arxiv.org/oai2").mock(
+    respx.get("https://oaipmh.arxiv.org/oai").mock(
         side_effect=httpx.ConnectError("offline")
     )
 

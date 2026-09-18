@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -21,7 +21,7 @@ from lxml import etree  # pyright: ignore[reportAttributeAccessIssue]
 LOGGER = logging.getLogger(__name__)
 
 OAI_NS: Final = "http://www.openarchives.org/OAI/2.0/"
-DEFAULT_ENDPOINT: Final = "https://export.arxiv.org/oai2"
+DEFAULT_ENDPOINT: Final = "https://oaipmh.arxiv.org/oai"
 DEFAULT_METADATA_PREFIX: Final = "arXivRaw"
 DEFAULT_USER_AGENT: Final = "arxiv-papers/0.1.0"
 
@@ -62,6 +62,7 @@ class OAIClientConfig:
     """Runtime settings for :class:`OAIClient`."""
 
     endpoint: str = DEFAULT_ENDPOINT
+    proxy: str | None = None
     metadata_prefix: str = DEFAULT_METADATA_PREFIX
     user_agent: str = DEFAULT_USER_AGENT
     connect_timeout: float = 10.0
@@ -77,6 +78,12 @@ class OAIClientConfig:
     def __post_init__(self) -> None:
         if not self.endpoint.startswith(("http://", "https://")):
             raise ValueError("endpoint must use http:// or https://")
+        if self.proxy is not None and not self.proxy.startswith(
+            ("http://", "https://", "socks5://", "socks5h://")
+        ):
+            raise ValueError(
+                "proxy must use http://, https://, socks5:// or socks5h://"
+            )
         if not self.metadata_prefix.strip():
             raise ValueError("metadata_prefix must not be empty")
         if self.max_retries < 0:
@@ -176,6 +183,7 @@ class OAIClient:
         config: OAIClientConfig | None = None,
         *,
         http_client: httpx.Client | None = None,
+        on_bytes_received: Callable[[int], None] | None = None,
     ) -> None:
         self.config = config or OAIClientConfig()
         self._owns_http_client = http_client is None
@@ -183,7 +191,9 @@ class OAIClient:
             timeout=self.config.timeout,
             headers={"User-Agent": self.config.user_agent},
             follow_redirects=True,
+            proxy=self.config.proxy,
         )
+        self._on_bytes_received = on_bytes_received
         self._last_request_at: float | None = None
 
     def __enter__(self) -> Self:
@@ -272,7 +282,7 @@ class OAIClient:
         attempts = self.config.max_retries + 1
         for attempt in range(1, attempts + 1):
             try:
-                response = self._http.get(self.config.endpoint, params=dict(params))
+                response = self._request_buffered(params)
             except httpx.RequestError as exc:
                 if attempt == attempts:
                     raise OAITransportError(
@@ -328,6 +338,30 @@ class OAIClient:
             time.sleep(delay)
 
         raise AssertionError("retry loop must return or raise")
+
+    def _request_buffered(self, params: Mapping[str, str]) -> httpx.Response:
+        """Read one response in chunks while preserving the existing API."""
+
+        with self._http.stream(
+            "GET", self.config.endpoint, params=dict(params)
+        ) as response:
+            content = bytearray()
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if self._on_bytes_received is not None:
+                    self._on_bytes_received(len(chunk))
+                if len(content) > self.config.max_response_bytes:
+                    raise OAITransportError(
+                        "response exceeds "
+                        f"max_response_bytes={self.config.max_response_bytes}"
+                    )
+            return httpx.Response(
+                status_code=response.status_code,
+                headers=response.headers,
+                content=bytes(content),
+                request=response.request,
+                extensions=response.extensions,
+            )
 
     def _respect_request_delay(self) -> None:
         if self._last_request_at is not None:

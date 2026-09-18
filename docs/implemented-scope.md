@@ -54,5 +54,16 @@ uv run arxiv-papers sync status --data-dir data-cs-2023
 uv run arxiv-papers sync verify --data-dir data-cs-2023
 ```
 
+如果终端使用的是本机代理但代理没有通过环境变量传给 Python，可以显式指定：
+
+```bash
+uv run arxiv-papers sync full \
+  --data-dir data-cs-2023 \
+  --proxy http://127.0.0.1:7890
+```
+
+同步开始请求每个 OAI 页面前会立即显示 `requesting OAI page ...`；页面完整下载、
+解析并写入 checkpoint 后，才会更新记录百分比、已下载大小、速度和剩余大小估算。
+
 修改创建时间或分类范围后，应使用新的 data 目录重新执行全量同步。旧的
 `arXiv` metadata 数据库不包含 `arXivRaw` 的版本历史，不能直接补齐历史版本。

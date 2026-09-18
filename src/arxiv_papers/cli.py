@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 
 from arxiv_papers.oai import OAIClient, OAIClientConfig
+from arxiv_papers.progress import ProgressDisplay
 from arxiv_papers.state import SyncStateStore
 from arxiv_papers.sync import FullSyncRunner, IncrementalSyncRunner
 
@@ -20,7 +21,12 @@ app.add_typer(sync_app, name="sync")
 @sync_app.command("full")
 def full_sync(
     endpoint: str = typer.Option(
-        "https://export.arxiv.org/oai2", help="OAI-PMH endpoint."
+        "https://oaipmh.arxiv.org/oai", help="OAI-PMH endpoint."
+    ),
+    proxy: str | None = typer.Option(
+        None,
+        "--proxy",
+        help="HTTP proxy, e.g. http://127.0.0.1:7890. Uses environment proxy when omitted.",
     ),
     metadata_prefix: str = typer.Option(
         "arXivRaw", "--metadata-prefix", help="OAI metadata prefix."
@@ -43,16 +49,32 @@ def full_sync(
     request_delay: float = typer.Option(
         3.0, min=0, help="Minimum seconds between OAI requests."
     ),
+    progress: bool = typer.Option(
+        True, "--progress/--no-progress", help="Show live sync progress on stderr."
+    ),
 ) -> None:
     """Run a full OAI-PMH ListRecords synchronization."""
 
     config = OAIClientConfig(
         endpoint=endpoint,
+        proxy=proxy,
         metadata_prefix=metadata_prefix,
         request_delay=request_delay,
     )
-    with OAIClient(config) as client:
-        result = FullSyncRunner(client, data_dir or DEFAULT_DATA_DIR).run(
+    progress_display = ProgressDisplay() if progress else None
+    if progress_display is not None:
+        progress_display.start()
+    with OAIClient(
+        config,
+        on_bytes_received=(
+            progress_display.received_bytes if progress_display else None
+        ),
+    ) as client:
+        result = FullSyncRunner(
+            client,
+            data_dir or DEFAULT_DATA_DIR,
+            progress=ProgressDisplay() if progress else None,
+        ).run(
             from_=from_,
             until=until,
             set_name=set_name,
@@ -95,7 +117,12 @@ def sync_verify(
 @sync_app.command("incremental")
 def incremental_sync(
     endpoint: str = typer.Option(
-        "https://export.arxiv.org/oai2", help="OAI-PMH endpoint."
+        "https://oaipmh.arxiv.org/oai", help="OAI-PMH endpoint."
+    ),
+    proxy: str | None = typer.Option(
+        None,
+        "--proxy",
+        help="HTTP proxy, e.g. http://127.0.0.1:7890. Uses environment proxy when omitted.",
     ),
     metadata_prefix: str = typer.Option(
         "arXivRaw", "--metadata-prefix", help="OAI metadata prefix."
@@ -124,19 +151,32 @@ def incremental_sync(
     safety_lag_days: int = typer.Option(
         1, min=0, help="Days withheld from the current date."
     ),
+    progress: bool = typer.Option(
+        True, "--progress/--no-progress", help="Show live sync progress on stderr."
+    ),
 ) -> None:
     """Run an incremental OAI-PMH synchronization."""
 
     config = OAIClientConfig(
         endpoint=endpoint,
+        proxy=proxy,
         metadata_prefix=metadata_prefix,
         request_delay=request_delay,
     )
-    with OAIClient(config) as client:
+    progress_display = ProgressDisplay() if progress else None
+    if progress_display is not None:
+        progress_display.start()
+    with OAIClient(
+        config,
+        on_bytes_received=(
+            progress_display.received_bytes if progress_display else None
+        ),
+    ) as client:
         result = IncrementalSyncRunner(
             client,
             data_dir or DEFAULT_DATA_DIR,
             overlap_days=overlap_days,
+            progress=ProgressDisplay() if progress else None,
         ).run(
             from_=from_,
             until=until,
