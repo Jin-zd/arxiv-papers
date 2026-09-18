@@ -111,3 +111,39 @@ def test_normalize_arxiv_id_supports_new_and_legacy_ids() -> None:
         3,
     )
     assert normalize_arxiv_id("hep-th/9901001")[:2] == ("hep-th/9901001", None)
+
+
+def test_parse_arxiv_raw_preserves_all_version_facts_and_raw_authors() -> None:
+    parsed = parse_oai_record(
+        OAIRecord(
+            identifier="oai:arXiv.org:2301.00001",
+            datestamp="2023-11-20",
+            metadata_xml=b"""<arXivRaw xmlns="http://arxiv.org/OAI/arXivRaw/">
+              <id>2301.00001</id>
+              <version version="v1">
+                <date>Sat, 18 Nov 2023 05:01:37 GMT</date>
+                <size>8209kb</size><source_type>D</source_type>
+              </version>
+              <version version="v2">
+                <date>Mon, 20 Nov 2023 05:01:37 GMT</date>
+                <size>8210kb</size><source_type>D</source_type>
+              </version>
+              <authors>Alice Example and Bob Example</authors>
+              <title>A raw paper</title>
+              <categories>stat.ML cs.AI</categories>
+              <abstract>A raw abstract.</abstract>
+            </arXivRaw>""",
+        )
+    )
+
+    assert parsed.metadata is not None
+    assert parsed.metadata.version == 2
+    assert parsed.metadata.created == date(2023, 11, 18)
+    assert parsed.metadata.authors_raw == "Alice Example and Bob Example"
+    assert [item.version for item in parsed.metadata.version_history] == [1, 2]
+    assert parsed.metadata.version_history[0].size_kb == 8209
+    assert parsed.metadata.version_history[1].source_type == "D"
+    assert [item.display_name for item in parsed.metadata.authors] == [
+        "Alice Example",
+        "Bob Example",
+    ]

@@ -19,6 +19,10 @@ class SyncState:
     from_date: str | None
     until_date: str | None
     set_name: str | None
+    metadata_prefix: str | None
+    created_from: str | None
+    created_until: str | None
+    category_prefixes: tuple[str, ...]
     next_resumption_token: str | None
     last_successful_page: int
     last_successful_datestamp: str | None
@@ -32,10 +36,15 @@ class SyncState:
 
 @dataclass(frozen=True, slots=True)
 class SyncContext:
+    sync_name: str
     run_id: str
     from_date: str | None
     until_date: str | None
     set_name: str | None
+    metadata_prefix: str | None
+    created_from: str | None
+    created_until: str | None
+    category_prefixes: tuple[str, ...]
     next_resumption_token: str | None
     next_page: int
     last_successful_page: int
@@ -64,6 +73,10 @@ class SyncStateStore:
                     from_date VARCHAR,
                     until_date VARCHAR,
                     set_name VARCHAR,
+                    metadata_prefix VARCHAR,
+                    created_from VARCHAR,
+                    created_until VARCHAR,
+                    category_prefixes VARCHAR,
                     next_resumption_token VARCHAR,
                     last_successful_page BIGINT NOT NULL,
                     last_successful_datestamp VARCHAR,
@@ -76,6 +89,15 @@ class SyncStateStore:
                 )
                 """
             )
+            for column, definition in (
+                ("metadata_prefix", "VARCHAR"),
+                ("created_from", "VARCHAR"),
+                ("created_until", "VARCHAR"),
+                ("category_prefixes", "VARCHAR"),
+            ):
+                connection.execute(
+                    f"ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS {column} {definition}"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sync_batches (
@@ -124,14 +146,79 @@ class SyncStateStore:
         from_date: str | None,
         until_date: str | None,
         set_name: str | None,
+        metadata_prefix: str | None,
+        created_from: str | None,
+        created_until: str | None,
+        category_prefixes: tuple[str, ...],
         resume: bool = True,
     ) -> SyncContext:
         """Create a run or resume the incomplete full-sync run."""
 
+        return self._begin(
+            sync_name="full",
+            mode="full",
+            run_id=run_id,
+            from_date=from_date,
+            until_date=until_date,
+            set_name=set_name,
+            metadata_prefix=metadata_prefix,
+            created_from=created_from,
+            created_until=created_until,
+            category_prefixes=category_prefixes,
+            resume=resume,
+            initial_datestamp=None,
+        )
+
+    def begin_incremental(
+        self,
+        *,
+        run_id: str,
+        from_date: str | None,
+        until_date: str | None,
+        set_name: str | None,
+        metadata_prefix: str | None,
+        created_from: str | None,
+        created_until: str | None,
+        category_prefixes: tuple[str, ...],
+        initial_datestamp: str | None,
+        resume: bool = True,
+    ) -> SyncContext:
+        return self._begin(
+            sync_name="incremental",
+            mode="incremental",
+            run_id=run_id,
+            from_date=from_date,
+            until_date=until_date,
+            set_name=set_name,
+            metadata_prefix=metadata_prefix,
+            created_from=created_from,
+            created_until=created_until,
+            category_prefixes=category_prefixes,
+            resume=resume,
+            initial_datestamp=initial_datestamp,
+        )
+
+    def _begin(
+        self,
+        *,
+        sync_name: str,
+        mode: str,
+        run_id: str,
+        from_date: str | None,
+        until_date: str | None,
+        set_name: str | None,
+        metadata_prefix: str | None,
+        created_from: str | None,
+        created_until: str | None,
+        category_prefixes: tuple[str, ...],
+        resume: bool,
+        initial_datestamp: str | None,
+    ) -> SyncContext:
         now = _now()
         with duckdb.connect(str(self.path)) as connection:
             existing_row = connection.execute(
-                "SELECT * FROM sync_state WHERE sync_name = 'full'"
+                f"SELECT {_STATE_COLUMNS} FROM sync_state WHERE sync_name = ?",
+                [sync_name],
             ).fetchone()
             existing = _state_from_row(existing_row) if existing_row else None
             can_resume = (
@@ -141,39 +228,70 @@ class SyncStateStore:
             )
             if can_resume:
                 assert existing is not None
-                _validate_same_scope(existing, from_date, until_date, set_name)
+                _validate_same_scope(
+                    existing,
+                    from_date,
+                    until_date,
+                    set_name,
+                    metadata_prefix,
+                    created_from,
+                    created_until,
+                    category_prefixes,
+                )
                 connection.execute(
                     """
                     UPDATE sync_state
                     SET status = 'running', updated_at = ?, error = NULL
-                    WHERE sync_name = 'full'
+                    WHERE sync_name = ?
                     """,
-                    [now],
+                    [now, sync_name],
                 )
                 return _context_from_state(existing, resumed=True)
 
-            connection.execute("DELETE FROM sync_state WHERE sync_name = 'full'")
+            connection.execute(
+                "DELETE FROM sync_state WHERE sync_name = ?", [sync_name]
+            )
             connection.execute(
                 """
                 INSERT INTO sync_state (
                     sync_name, run_id, mode, status, from_date, until_date,
-                    set_name, next_resumption_token, last_successful_page,
+                    set_name, metadata_prefix, created_from, created_until,
+                    category_prefixes, next_resumption_token, last_successful_page,
                     last_successful_datestamp, recovery_count, started_at,
                     updated_at, completed_at, snapshot_path, error
-                ) VALUES ('full', ?, 'full', 'running', ?, ?, ?, NULL, 0,
-                          NULL, 0, ?, ?, NULL, NULL, NULL)
+                ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, NULL, 0,
+                          ?, 0, ?, ?, NULL, NULL, NULL)
                 """,
-                [run_id, from_date, until_date, set_name, now, now],
+                [
+                    sync_name,
+                    run_id,
+                    mode,
+                    from_date,
+                    until_date,
+                    set_name,
+                    metadata_prefix,
+                    created_from,
+                    created_until,
+                    json.dumps(category_prefixes),
+                    initial_datestamp,
+                    now,
+                    now,
+                ],
             )
         return SyncContext(
+            sync_name=sync_name,
             run_id=run_id,
             from_date=from_date,
             until_date=until_date,
             set_name=set_name,
+            metadata_prefix=metadata_prefix,
+            created_from=created_from,
+            created_until=created_until,
+            category_prefixes=category_prefixes,
             next_resumption_token=None,
             next_page=1,
             last_successful_page=0,
-            last_successful_datestamp=None,
+            last_successful_datestamp=initial_datestamp,
             resumed=False,
         )
 
@@ -224,6 +342,7 @@ class SyncStateStore:
         warnings: int,
         max_datestamp: str | None,
         next_resumption_token: str | None,
+        sync_name: str = "full",
     ) -> None:
         now = _now()
         with duckdb.connect(str(self.path)) as connection:
@@ -262,7 +381,7 @@ class SyncStateStore:
                         ELSE last_successful_datestamp
                     END,
                     error = NULL
-                WHERE sync_name = 'full' AND run_id = ?
+                WHERE sync_name = ? AND run_id = ?
                 """,
                 [
                     now,
@@ -272,12 +391,15 @@ class SyncStateStore:
                     max_datestamp,
                     max_datestamp,
                     max_datestamp,
+                    sync_name,
                     run_id,
                 ],
             )
             connection.execute("COMMIT")
 
-    def mark_token_invalid(self, *, run_id: str, error: str) -> None:
+    def mark_token_invalid(
+        self, *, run_id: str, error: str, sync_name: str = "full"
+    ) -> None:
         with duckdb.connect(str(self.path)) as connection:
             connection.execute(
                 """
@@ -285,12 +407,14 @@ class SyncStateStore:
                 SET status = 'running', error = ?, updated_at = ?,
                     next_resumption_token = NULL,
                     recovery_count = recovery_count + 1
-                WHERE sync_name = 'full' AND run_id = ?
+                WHERE sync_name = ? AND run_id = ?
                 """,
-                [error, _now(), run_id],
+                [error, _now(), sync_name, run_id],
             )
 
-    def mark_completed(self, *, run_id: str, snapshot_path: Path) -> None:
+    def mark_completed(
+        self, *, run_id: str, snapshot_path: Path, sync_name: str = "full"
+    ) -> None:
         now = _now()
         with duckdb.connect(str(self.path)) as connection:
             connection.execute(
@@ -298,20 +422,20 @@ class SyncStateStore:
                 UPDATE sync_state
                 SET status = 'completed', completed_at = ?, updated_at = ?,
                     snapshot_path = ?, error = NULL
-                WHERE sync_name = 'full' AND run_id = ?
+                WHERE sync_name = ? AND run_id = ?
                 """,
-                [now, now, str(snapshot_path), run_id],
+                [now, now, str(snapshot_path), sync_name, run_id],
             )
 
-    def mark_failed(self, *, run_id: str, error: str) -> None:
+    def mark_failed(self, *, run_id: str, error: str, sync_name: str = "full") -> None:
         with duckdb.connect(str(self.path)) as connection:
             connection.execute(
                 """
                 UPDATE sync_state
                 SET status = 'failed', updated_at = ?, error = ?
-                WHERE sync_name = 'full' AND run_id = ?
+                WHERE sync_name = ? AND run_id = ?
                 """,
-                [_now(), error[:4000], run_id],
+                [_now(), error[:4000], sync_name, run_id],
             )
 
     def record_dead_letter(
@@ -353,17 +477,37 @@ class SyncStateStore:
     def get_state(self, sync_name: str = "full") -> SyncState | None:
         with duckdb.connect(str(self.path), read_only=True) as connection:
             row = connection.execute(
-                "SELECT * FROM sync_state WHERE sync_name = ?", [sync_name]
+                f"SELECT {_STATE_COLUMNS} FROM sync_state WHERE sync_name = ?",
+                [sync_name],
             ).fetchone()
         return _state_from_row(row) if row else None
 
-    def status(self) -> dict[str, object]:
-        state = self.get_state()
+    def latest_completed(self) -> SyncState | None:
+        with duckdb.connect(str(self.path), read_only=True) as connection:
+            row = connection.execute(
+                f"""
+                SELECT {_STATE_COLUMNS}
+                FROM sync_state
+                WHERE status = 'completed' AND snapshot_path IS NOT NULL
+                ORDER BY completed_at DESC NULLS LAST
+                LIMIT 1
+                """
+            ).fetchone()
+        return _state_from_row(row) if row else None
+
+    def status(self, sync_name: str | None = None) -> dict[str, object]:
+        state = self.get_state(sync_name) if sync_name else None
         result: dict[str, object] = {
             "state_path": str(self.path),
             "state": _state_to_dict(state) if state else None,
         }
         with duckdb.connect(str(self.path), read_only=True) as connection:
+            state_rows = connection.execute(
+                f"SELECT {_STATE_COLUMNS} FROM sync_state ORDER BY sync_name"
+            ).fetchall()
+            result["states"] = [
+                _state_to_dict(_state_from_row(row)) for row in state_rows
+            ]
             batch_rows = connection.execute(
                 """
                 SELECT status, count(*) AS count
@@ -381,8 +525,8 @@ class SyncStateStore:
             result["dead_letters"] = int(dead_letter_row[0]) if dead_letter_row else 0
         return result
 
-    def verify(self) -> dict[str, object]:
-        state = self.get_state()
+    def verify(self, sync_name: str = "full") -> dict[str, object]:
+        state = self.get_state(sync_name)
         checks: dict[str, object] = {
             "state_exists": state is not None,
             "status_completed": bool(state and state.status == "completed"),
@@ -448,15 +592,19 @@ def _state_from_row(row: tuple[object, ...] | None) -> SyncState | None:
         from_date=_optional_string(row[4]),
         until_date=_optional_string(row[5]),
         set_name=_optional_string(row[6]),
-        next_resumption_token=_optional_string(row[7]),
-        last_successful_page=_as_int(row[8]),
-        last_successful_datestamp=_optional_string(row[9]),
-        recovery_count=_as_int(row[10]),
-        started_at=str(row[11]),
-        updated_at=str(row[12]),
-        completed_at=_optional_string(row[13]),
-        snapshot_path=_optional_string(row[14]),
-        error=_optional_string(row[15]),
+        metadata_prefix=_optional_string(row[7]),
+        created_from=_optional_string(row[8]),
+        created_until=_optional_string(row[9]),
+        category_prefixes=_category_prefixes(row[10]),
+        next_resumption_token=_optional_string(row[11]),
+        last_successful_page=_as_int(row[12]),
+        last_successful_datestamp=_optional_string(row[13]),
+        recovery_count=_as_int(row[14]),
+        started_at=str(row[15]),
+        updated_at=str(row[16]),
+        completed_at=_optional_string(row[17]),
+        snapshot_path=_optional_string(row[18]),
+        error=_optional_string(row[19]),
     )
 
 
@@ -471,6 +619,10 @@ def _state_to_dict(state: SyncState | None) -> dict[str, object] | None:
         "from_date": state.from_date,
         "until_date": state.until_date,
         "set_name": state.set_name,
+        "metadata_prefix": state.metadata_prefix,
+        "created_from": state.created_from,
+        "created_until": state.created_until,
+        "category_prefixes": list(state.category_prefixes),
         "next_resumption_token": state.next_resumption_token,
         "last_successful_page": state.last_successful_page,
         "last_successful_datestamp": state.last_successful_datestamp,
@@ -485,10 +637,15 @@ def _state_to_dict(state: SyncState | None) -> dict[str, object] | None:
 
 def _context_from_state(state: SyncState, *, resumed: bool) -> SyncContext:
     return SyncContext(
+        sync_name=state.sync_name,
         run_id=state.run_id,
         from_date=state.from_date,
         until_date=state.until_date,
         set_name=state.set_name,
+        metadata_prefix=state.metadata_prefix,
+        created_from=state.created_from,
+        created_until=state.created_until,
+        category_prefixes=state.category_prefixes,
         next_resumption_token=state.next_resumption_token,
         next_page=state.last_successful_page + 1,
         last_successful_page=state.last_successful_page,
@@ -502,14 +659,34 @@ def _validate_same_scope(
     from_date: str | None,
     until_date: str | None,
     set_name: str | None,
+    metadata_prefix: str | None,
+    created_from: str | None,
+    created_until: str | None,
+    category_prefixes: tuple[str, ...],
 ) -> None:
-    requested = (from_date, until_date, set_name)
-    existing = (state.from_date, state.until_date, state.set_name)
+    requested = (
+        from_date,
+        until_date,
+        set_name,
+        metadata_prefix,
+        created_from,
+        created_until,
+        category_prefixes,
+    )
+    existing = (
+        state.from_date,
+        state.until_date,
+        state.set_name,
+        state.metadata_prefix,
+        state.created_from,
+        state.created_until,
+        state.category_prefixes,
+    )
     if all(value is None for value in requested):
         return
     if requested != existing:
         raise ValueError(
-            "an incomplete full sync exists with different from/until/set parameters"
+            "an incomplete sync exists with different source or filter parameters"
         )
 
 
@@ -521,6 +698,26 @@ def _as_int(value: object) -> int:
     if value is None:
         raise ValueError("required integer value is NULL")
     return int(str(value))
+
+
+def _category_prefixes(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed)
+
+
+_STATE_COLUMNS = (
+    "sync_name, run_id, mode, status, from_date, until_date, set_name, "
+    "metadata_prefix, created_from, created_until, category_prefixes, "
+    "next_resumption_token, last_successful_page, last_successful_datestamp, "
+    "recovery_count, started_at, updated_at, completed_at, snapshot_path, error"
+)
 
 
 __all__ = ["SyncContext", "SyncState", "SyncStateStore", "overlap_datestamp"]

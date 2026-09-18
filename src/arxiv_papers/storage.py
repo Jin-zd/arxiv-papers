@@ -15,24 +15,36 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from arxiv_papers.metadata import ParsedArxivRecord, normalize_arxiv_id
+from arxiv_papers.metadata import (
+    ArxivPaperMetadata,
+    ParsedArxivRecord,
+    normalize_arxiv_id,
+)
 
 PAPER_VERSION_SCHEMA = pa.schema(
     [
         pa.field("arxiv_id", pa.string(), nullable=False),
         pa.field("version", pa.int64()),
-        pa.field("title", pa.string(), nullable=False),
-        pa.field("abstract", pa.string(), nullable=False),
+        pa.field("title", pa.string()),
+        pa.field("abstract", pa.string()),
         pa.field("created", pa.date32()),
         pa.field("updated", pa.date32()),
+        # Values are normalized to UTC by the parser; Parquet stores them as
+        # UTC wall-clock timestamps so DuckDB does not need a timezone package.
+        pa.field("first_submitted_at", pa.timestamp("us")),
+        pa.field("submitted_at", pa.timestamp("us")),
+        pa.field("size_kb", pa.int64()),
+        pa.field("source_type", pa.string()),
+        pa.field("is_current", pa.bool_(), nullable=False),
         pa.field("comments", pa.string()),
         pa.field("journal_ref", pa.string()),
         pa.field("doi", pa.string()),
         pa.field("license", pa.string()),
         pa.field("primary_category", pa.string()),
+        pa.field("authors_raw", pa.string()),
         pa.field("oai_identifier", pa.string(), nullable=False),
         pa.field("oai_datestamp", pa.string()),
-        pa.field("metadata_hash", pa.string(), nullable=False),
+        pa.field("metadata_hash", pa.string()),
     ]
 )
 AUTHOR_SCHEMA = pa.schema(
@@ -77,6 +89,7 @@ TABLE_SCHEMAS = {
     "categories": CATEGORY_SCHEMA,
     "deleted_records": DELETED_SCHEMA,
 }
+SNAPSHOT_SCHEMA_VERSION = "2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,24 +174,35 @@ class ParquetBatchStore:
                 continue
 
             metadata = record.metadata
-            rows["paper_versions"].append(
-                {
-                    "arxiv_id": metadata.arxiv_id,
-                    "version": metadata.version,
-                    "title": metadata.title,
-                    "abstract": metadata.abstract,
-                    "created": metadata.created,
-                    "updated": metadata.updated,
-                    "comments": metadata.comments,
-                    "journal_ref": metadata.journal_ref,
-                    "doi": metadata.doi,
-                    "license": metadata.license,
-                    "primary_category": metadata.primary_category,
-                    "oai_identifier": record.oai_identifier,
-                    "oai_datestamp": record.oai_datestamp,
-                    "metadata_hash": record.metadata_hash,
-                }
-            )
+            current_version = metadata.version
+            version_history = metadata.version_history
+            if version_history:
+                for version in version_history:
+                    is_current = version.version == current_version
+                    rows["paper_versions"].append(
+                        _version_row(
+                            metadata=metadata,
+                            record=record,
+                            version=version.version,
+                            submitted_at=version.submitted_at,
+                            size_kb=version.size_kb,
+                            source_type=version.source_type,
+                            is_current=is_current,
+                        )
+                    )
+            else:
+                rows["paper_versions"].append(
+                    _version_row(
+                        metadata=metadata,
+                        record=record,
+                        version=current_version,
+                        submitted_at=None,
+                        size_kb=None,
+                        source_type=None,
+                        is_current=True,
+                    )
+                )
+
             for author_order, author in enumerate(metadata.authors):
                 author_key = _author_key(author.display_name)
                 rows["authors"].append(
@@ -196,7 +220,7 @@ class ParquetBatchStore:
                 rows["paper_authors"].append(
                     {
                         "arxiv_id": metadata.arxiv_id,
-                        "version": metadata.version,
+                        "version": current_version,
                         "author_key": author_key,
                         "author_order": author_order,
                     }
@@ -204,7 +228,7 @@ class ParquetBatchStore:
             rows["categories"].extend(
                 {
                     "arxiv_id": metadata.arxiv_id,
-                    "version": metadata.version,
+                    "version": current_version,
                     "category": category.name,
                     "is_primary": category.is_primary,
                 }
@@ -217,7 +241,11 @@ class DuckDBSnapshotBuilder:
     """Build a self-contained read-only query snapshot from Parquet parts."""
 
     def build(
-        self, parquet_root: Path | str, output_path: Path | str
+        self,
+        parquet_root: Path | str,
+        output_path: Path | str,
+        *,
+        base_snapshot: Path | str | None = None,
     ) -> SnapshotBuildResult:
         parquet_root = Path(parquet_root)
         output_path = Path(output_path)
@@ -226,7 +254,7 @@ class DuckDBSnapshotBuilder:
         connection: duckdb.DuckDBPyConnection | None = None
         try:
             connection = duckdb.connect(str(temporary_path))
-            self._build_tables(connection, parquet_root)
+            self._build_tables(connection, parquet_root, base_snapshot)
             connection.execute("CHECKPOINT")
             connection.close()
             connection = None
@@ -249,29 +277,109 @@ class DuckDBSnapshotBuilder:
         }
         return SnapshotBuildResult(path=output_path, **counts)
 
-    def _build_tables(self, connection: duckdb.DuckDBPyConnection, root: Path) -> None:
+    @staticmethod
+    def validate_base_snapshot(snapshot_path: Path | str) -> None:
+        """Reject snapshots from the pre-``arXivRaw`` schema."""
+
+        try:
+            with duckdb.connect(str(snapshot_path), read_only=True) as connection:
+                row = connection.execute(
+                    "SELECT value FROM library_metadata WHERE key = 'schema_version'"
+                ).fetchone()
+        except duckdb.Error as error:
+            raise RuntimeError(
+                "base snapshot is not compatible with the version-history schema; "
+                "run a new full sync in a new data directory"
+            ) from error
+        if row is None or str(row[0]) != SNAPSHOT_SCHEMA_VERSION:
+            raise RuntimeError(
+                "base snapshot uses an older schema without arXivRaw version history; "
+                "run a new full sync in a new data directory"
+            )
+
+    def _build_tables(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        root: Path,
+        base_snapshot: Path | str | None = None,
+    ) -> None:
         paper_versions = _read_parquet_sql(root / "paper_versions" / "*.parquet")
         authors = _read_parquet_sql(root / "authors" / "*.parquet")
         paper_authors = _read_parquet_sql(root / "paper_authors" / "*.parquet")
         categories = _read_parquet_sql(root / "categories" / "*.parquet")
         deleted = _read_parquet_sql(root / "deleted_records" / "*.parquet")
 
+        if base_snapshot is not None:
+            base_path = _read_parquet_sql(Path(base_snapshot))
+            connection.execute(f"ATTACH '{base_path}' AS base_snapshot (READ_ONLY)")
+            connection.execute(
+                f"""
+                CREATE TEMP VIEW source_paper_versions AS
+                SELECT * FROM base_snapshot.paper_versions
+                UNION ALL SELECT * FROM read_parquet('{paper_versions}')
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE TEMP VIEW source_deleted_records AS
+                SELECT * FROM base_snapshot.deleted_records
+                UNION ALL SELECT * FROM read_parquet('{deleted}')
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE TEMP VIEW source_authors AS
+                SELECT * FROM base_snapshot.authors
+                UNION ALL SELECT * FROM read_parquet('{authors}')
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE TEMP VIEW source_paper_authors AS
+                SELECT * FROM base_snapshot.paper_authors
+                UNION ALL SELECT * FROM read_parquet('{paper_authors}')
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE TEMP VIEW source_categories AS
+                SELECT * FROM base_snapshot.categories
+                UNION ALL SELECT * FROM read_parquet('{categories}')
+                """
+            )
+        else:
+            connection.execute(
+                f"CREATE TEMP VIEW source_paper_versions AS SELECT * FROM read_parquet('{paper_versions}')"
+            )
+            connection.execute(
+                f"CREATE TEMP VIEW source_deleted_records AS SELECT * FROM read_parquet('{deleted}')"
+            )
+            connection.execute(
+                f"CREATE TEMP VIEW source_authors AS SELECT * FROM read_parquet('{authors}')"
+            )
+            connection.execute(
+                f"CREATE TEMP VIEW source_paper_authors AS SELECT * FROM read_parquet('{paper_authors}')"
+            )
+            connection.execute(
+                f"CREATE TEMP VIEW source_categories AS SELECT * FROM read_parquet('{categories}')"
+            )
+
         connection.execute(
-            f"""
+            """
             CREATE TABLE paper_versions AS
             SELECT * EXCLUDE (dedupe_rank)
             FROM (
                 SELECT *, row_number() OVER (
-                    PARTITION BY arxiv_id, COALESCE(version, 0), metadata_hash
+                    PARTITION BY arxiv_id, COALESCE(version, 0)
                     ORDER BY oai_datestamp DESC NULLS LAST, oai_identifier DESC
                 ) AS dedupe_rank
-                FROM read_parquet('{paper_versions}')
+                FROM source_paper_versions
             )
             WHERE dedupe_rank = 1
             """
         )
         connection.execute(
-            f"""
+            """
             CREATE TABLE deleted_records AS
             SELECT * EXCLUDE (dedupe_rank)
             FROM (
@@ -279,7 +387,7 @@ class DuckDBSnapshotBuilder:
                     PARTITION BY arxiv_id, COALESCE(version, 0), oai_datestamp
                     ORDER BY oai_identifier DESC
                 ) AS dedupe_rank
-                FROM read_parquet('{deleted}')
+                FROM source_deleted_records
             )
             WHERE dedupe_rank = 1
             """
@@ -296,7 +404,9 @@ class DuckDBSnapshotBuilder:
                              oai_identifier DESC
                 ) AS current_rank
                 FROM paper_versions AS versions
-                WHERE NOT EXISTS (
+                WHERE is_current
+                  AND title IS NOT NULL
+                  AND NOT EXISTS (
                     SELECT 1 FROM deleted_records AS deleted
                     WHERE deleted.arxiv_id = versions.arxiv_id
                       AND (
@@ -310,37 +420,38 @@ class DuckDBSnapshotBuilder:
             """
         )
         connection.execute(
-            f"""
+            """
             CREATE TABLE authors AS
-            SELECT DISTINCT * FROM read_parquet('{authors}')
+            SELECT DISTINCT * FROM source_authors
             """
         )
         connection.execute(
-            f"""
+            """
             CREATE TABLE paper_authors AS
-            SELECT DISTINCT * FROM read_parquet('{paper_authors}')
+            SELECT DISTINCT * FROM source_paper_authors
             """
         )
         connection.execute(
-            f"""
+            """
             CREATE TABLE categories AS
-            SELECT DISTINCT * FROM read_parquet('{categories}')
+            SELECT DISTINCT * FROM source_categories
             """
         )
         connection.execute(
             """
             CREATE TABLE library_metadata AS
             SELECT * FROM (VALUES
-                ('schema_version', '1'),
+                ('schema_version', ?),
                 ('built_at', ?),
                 ('source', 'arXiv OAI-PMH')
             ) AS metadata(key, value)
             """,
-            [datetime.now(UTC).isoformat()],
+            [SNAPSHOT_SCHEMA_VERSION, datetime.now(UTC).isoformat()],
         )
         for table, column in (
             ("papers", "arxiv_id"),
             ("paper_versions", "arxiv_id"),
+            ("paper_versions", "version"),
             ("authors", "author_key"),
             ("categories", "category"),
         ):
@@ -359,6 +470,43 @@ class DuckDBSnapshotBuilder:
 
 def _author_key(display_name: str) -> str:
     return hashlib.sha256(display_name.casefold().encode("utf-8")).hexdigest()
+
+
+def _version_row(
+    *,
+    metadata: ArxivPaperMetadata,
+    record: ParsedArxivRecord,
+    version: int | None,
+    submitted_at: object,
+    size_kb: int | None,
+    source_type: str | None,
+    is_current: bool,
+) -> dict[str, object]:
+    current_fields: dict[str, object] = {
+        "title": metadata.title if is_current else None,
+        "abstract": metadata.abstract if is_current else None,
+        "created": metadata.created,
+        "updated": metadata.updated if is_current else None,
+        "comments": metadata.comments if is_current else None,
+        "journal_ref": metadata.journal_ref if is_current else None,
+        "doi": metadata.doi if is_current else None,
+        "license": metadata.license if is_current else None,
+        "primary_category": metadata.primary_category if is_current else None,
+        "authors_raw": metadata.authors_raw if is_current else None,
+        "metadata_hash": record.metadata_hash if is_current else None,
+    }
+    return {
+        "arxiv_id": metadata.arxiv_id,
+        "version": version,
+        **current_fields,
+        "first_submitted_at": metadata.first_submitted_at,
+        "submitted_at": submitted_at,
+        "size_kb": size_kb,
+        "source_type": source_type,
+        "is_current": is_current,
+        "oai_identifier": record.oai_identifier,
+        "oai_datestamp": record.oai_datestamp,
+    }
 
 
 def _read_parquet_sql(path: Path) -> str:

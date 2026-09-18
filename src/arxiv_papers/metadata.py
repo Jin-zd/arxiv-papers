@@ -6,7 +6,8 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Final
 
 from lxml import etree  # pyright: ignore[reportAttributeAccessIssue]
@@ -45,6 +46,17 @@ class ArxivCategory(BaseModel):
     is_primary: bool = False
 
 
+class ArxivVersionHistory(BaseModel):
+    """Version facts exposed by the official ``arXivRaw`` format."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    version: int
+    submitted_at: datetime
+    size_kb: int | None = None
+    source_type: str | None = None
+
+
 class ArxivPaperMetadata(BaseModel):
     """Normalized metadata for one arXiv version."""
 
@@ -63,6 +75,21 @@ class ArxivPaperMetadata(BaseModel):
     doi: str | None = None
     license: str | None = None
     report_numbers: tuple[str, ...] = ()
+    authors_raw: str | None = None
+    version_history: tuple[ArxivVersionHistory, ...] = ()
+
+    @property
+    def first_submitted_at(self) -> datetime | None:
+        if self.version_history:
+            return min(item.submitted_at for item in self.version_history)
+        if self.created is None:
+            return None
+        return datetime.combine(self.created, datetime.min.time(), tzinfo=UTC)
+
+    @property
+    def first_submitted_date(self) -> date | None:
+        submitted_at = self.first_submitted_at
+        return submitted_at.date() if submitted_at else self.created
 
     @property
     def primary_category(self) -> str | None:
@@ -109,6 +136,8 @@ class _XMLFields:
     doi: str | None
     license: str | None
     report_numbers: tuple[str, ...]
+    authors_raw: str | None
+    version_history: tuple[ArxivVersionHistory, ...]
     warnings: tuple[str, ...]
 
 
@@ -152,10 +181,13 @@ def parse_oai_record(record: OAIRecord) -> ParsedArxivRecord:
         raise MetadataParseError(f"record {record.identifier} metadata has no arXiv id")
     arxiv_id, version, id_warnings = normalize_arxiv_id(raw_id)
     fields = _parse_fields(root)
+    current_version = version or (
+        fields.version_history[-1].version if fields.version_history else None
+    )
     warnings = (*id_warnings, *fields.warnings)
     metadata = ArxivPaperMetadata(
         arxiv_id=arxiv_id,
-        version=version,
+        version=current_version,
         title=fields.title,
         abstract=fields.abstract,
         authors=fields.authors,
@@ -167,6 +199,8 @@ def parse_oai_record(record: OAIRecord) -> ParsedArxivRecord:
         doi=fields.doi,
         license=fields.license,
         report_numbers=fields.report_numbers,
+        authors_raw=fields.authors_raw,
+        version_history=fields.version_history,
     )
     return ParsedArxivRecord(
         oai_identifier=record.identifier,
@@ -215,16 +249,21 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
         warnings.append("missing abstract")
 
     authors: list[ArxivAuthor] = []
+    authors_raw: str | None = None
     authors_element = _find_child(root, "authors")
     if authors_element is not None:
-        for index, author_element in enumerate(
-            _children(authors_element, "author"), start=1
-        ):
-            author = _parse_author(author_element)
-            if author is None:
-                warnings.append(f"author {index} has no usable name")
-            else:
-                authors.append(author)
+        author_elements = _children(authors_element, "author")
+        if author_elements:
+            for index, author_element in enumerate(author_elements, start=1):
+                author = _parse_author(author_element)
+                if author is None:
+                    warnings.append(f"author {index} has no usable name")
+                else:
+                    authors.append(author)
+        else:
+            authors_raw = _text(authors_element)
+            if authors_raw:
+                authors.extend(_parse_raw_authors(authors_raw))
     if not authors:
         warnings.append("missing authors")
 
@@ -238,8 +277,15 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
     if not categories:
         warnings.append("missing categories")
 
+    version_history = _parse_version_history(root, warnings)
     created, created_warning = _parse_date_field(root, "created")
+    if created is None and version_history:
+        created = version_history[0].submitted_at.date()
+        created_warning = None
     updated, updated_warning = _parse_date_field(root, "updated")
+    if updated is None and version_history:
+        updated = version_history[-1].submitted_at.date()
+        updated_warning = None
     if created_warning:
         warnings.append(created_warning)
     if updated_warning:
@@ -257,8 +303,61 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
         doi=_normalize_doi(_optional_text(root, "doi")),
         license=_optional_text(root, "license"),
         report_numbers=_split_optional_field(root, "report-no"),
+        authors_raw=authors_raw,
+        version_history=version_history,
         warnings=tuple(warnings),
     )
+
+
+def _parse_raw_authors(value: str) -> list[ArxivAuthor]:
+    return [
+        ArxivAuthor(display_name=name.strip())
+        for name in re.split(r"\s+and\s+", value)
+        if name.strip()
+    ]
+
+
+def _parse_version_history(
+    root: etree._Element, warnings: list[str]
+) -> tuple[ArxivVersionHistory, ...]:
+    versions: list[ArxivVersionHistory] = []
+    for element in _children(root, "version"):
+        value = element.get("version")
+        if value is None:
+            warnings.append("version is missing version attribute")
+            continue
+        match = re.fullmatch(r"v([1-9][0-9]*)", value.strip(), flags=re.IGNORECASE)
+        if match is None:
+            warnings.append(f"invalid version value: {value}")
+            continue
+        date_text = _optional_text(element, "date")
+        if date_text is None:
+            warnings.append(f"version {value} is missing date")
+            continue
+        try:
+            submitted_at = parsedate_to_datetime(date_text)
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=UTC)
+            submitted_at = submitted_at.astimezone(UTC)
+        except (TypeError, ValueError, OverflowError):
+            warnings.append(f"invalid version {value} date: {date_text}")
+            continue
+        size_text = _optional_text(element, "size")
+        try:
+            size_kb = int(size_text.removesuffix("kb").strip()) if size_text else None
+        except ValueError:
+            size_kb = None
+            warnings.append(f"invalid version {value} size: {size_text}")
+        versions.append(
+            ArxivVersionHistory(
+                version=int(match.group(1)),
+                submitted_at=submitted_at,
+                size_kb=size_kb,
+                source_type=_optional_text(element, "source_type"),
+            )
+        )
+    versions.sort(key=lambda item: item.version)
+    return tuple(versions)
 
 
 def _parse_author(element: etree._Element) -> ArxivAuthor | None:
@@ -340,6 +439,7 @@ __all__ = [
     "ArxivAuthor",
     "ArxivCategory",
     "ArxivPaperMetadata",
+    "ArxivVersionHistory",
     "MetadataParseError",
     "ParsedArxivRecord",
     "normalize_arxiv_id",

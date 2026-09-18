@@ -76,7 +76,7 @@ def test_list_records_follows_resumption_token_and_parses_records() -> None:
     assert pages[1].records[0].deleted is True
     assert pages[1].resumption_token is None
     assert route.call_count == 2
-    assert route.calls[0].request.url.params["metadataPrefix"] == "arXiv"
+    assert route.calls[0].request.url.params["metadataPrefix"] == "arXivRaw"
     assert route.calls[0].request.url.params["from"] == "2024-01-01"
     assert route.calls[0].request.url.params["until"] == "2024-01-31"
     assert route.calls[0].request.url.params["set"] == "physics:hep-th"
