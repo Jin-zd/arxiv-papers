@@ -23,6 +23,7 @@ from arxiv_papers.metadata import (
 )
 from arxiv_papers.oai import OAIClient, OAIPage, OAIProtocolError
 from arxiv_papers.progress import ProgressDisplay
+from arxiv_papers.snapshots import SnapshotCatalog
 from arxiv_papers.state import SyncStateStore, overlap_datestamp
 from arxiv_papers.storage import (
     DuckDBSnapshotBuilder,
@@ -89,6 +90,7 @@ class FullSyncRunner:
         state_store: SyncStateStore | None = None,
         overlap_days: int = 3,
         progress: ProgressDisplay | None = None,
+        snapshot_retention: int = 3,
     ) -> None:
         if overlap_days < 0:
             raise ValueError("overlap_days must be non-negative")
@@ -101,6 +103,9 @@ class FullSyncRunner:
         )
         self.overlap_days = overlap_days
         self.progress = progress
+        self.snapshot_catalog = SnapshotCatalog(
+            self.data_dir / "duckdb", retention=snapshot_retention
+        )
 
     def run(
         self,
@@ -220,9 +225,21 @@ class FullSyncRunner:
                 self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
             )
             snapshot = self.snapshot_builder.build(parquet_root, snapshot_path)
+            self.snapshot_catalog.publish(
+                snapshot.path,
+                generation=context.run_id,
+                counts={
+                    "paper_versions": snapshot.paper_versions,
+                    "papers": snapshot.papers,
+                    "authors": snapshot.authors,
+                    "categories": snapshot.categories,
+                    "deleted_records": snapshot.deleted_records,
+                },
+            )
             self.state_store.mark_completed(
                 run_id=context.run_id, snapshot_path=snapshot.path
             )
+            self.snapshot_catalog.prune()
             result = FullSyncResult(
                 run_id=context.run_id,
                 stats=stats,
@@ -545,11 +562,23 @@ class IncrementalSyncRunner(FullSyncRunner):
             snapshot = self.snapshot_builder.build(
                 parquet_root, snapshot_path, base_snapshot=base_snapshot
             )
+            self.snapshot_catalog.publish(
+                snapshot.path,
+                generation=context.run_id,
+                counts={
+                    "paper_versions": snapshot.paper_versions,
+                    "papers": snapshot.papers,
+                    "authors": snapshot.authors,
+                    "categories": snapshot.categories,
+                    "deleted_records": snapshot.deleted_records,
+                },
+            )
             self.state_store.mark_completed(
                 run_id=context.run_id,
                 snapshot_path=snapshot.path,
                 sync_name="incremental",
             )
+            self.snapshot_catalog.prune()
             if self.progress is not None:
                 self.progress.finish(success=True)
             return FullSyncResult(

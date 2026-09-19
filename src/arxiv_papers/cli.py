@@ -190,4 +190,30 @@ def incremental_sync(
     typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
 
 
+@app.command("mcp")
+def mcp_server(
+    data_dir: Path = typer.Option(  # noqa: B008
+        DEFAULT_DATA_DIR,
+        help="Local data directory containing sync state and snapshots.",
+    ),
+    snapshot: Path | None = typer.Option(  # noqa: B008
+        None,
+        help="Explicit DuckDB snapshot path; otherwise use the latest completed snapshot.",
+    ),
+    sync_name: str | None = typer.Option(
+        None,
+        "--sync-name",
+        help="Select a completed sync state instead of the latest one.",
+    ),
+) -> None:
+    """Run the read-only local arXiv MCP server over STDIO."""
+
+    from arxiv_papers.mcp_server import SnapshotResolutionError, run_stdio
+
+    try:
+        run_stdio(data_dir=data_dir, snapshot=snapshot, sync_name=sync_name)
+    except SnapshotResolutionError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
 __all__ = ["app"]

@@ -89,7 +89,7 @@ TABLE_SCHEMAS = {
     "categories": CATEGORY_SCHEMA,
     "deleted_records": DELETED_SCHEMA,
 }
-SNAPSHOT_SCHEMA_VERSION = "2"
+SNAPSHOT_SCHEMA_VERSION = "3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +255,8 @@ class DuckDBSnapshotBuilder:
         try:
             connection = duckdb.connect(str(temporary_path))
             self._build_tables(connection, parquet_root, base_snapshot)
+            self._build_search_indexes(connection)
+            self._run_query_smoke_test(connection)
             connection.execute("CHECKPOINT")
             connection.close()
             connection = None
@@ -291,7 +293,7 @@ class DuckDBSnapshotBuilder:
                 "base snapshot is not compatible with the version-history schema; "
                 "run a new full sync in a new data directory"
             ) from error
-        if row is None or str(row[0]) != SNAPSHOT_SCHEMA_VERSION:
+        if row is None or str(row[0]) not in {"2", SNAPSHOT_SCHEMA_VERSION}:
             raise RuntimeError(
                 "base snapshot uses an older schema without arXivRaw version history; "
                 "run a new full sync in a new data directory"
@@ -329,8 +331,17 @@ class DuckDBSnapshotBuilder:
             connection.execute(
                 f"""
                 CREATE TEMP VIEW source_authors AS
-                SELECT * FROM base_snapshot.authors
-                UNION ALL SELECT * FROM read_parquet('{authors}')
+                SELECT author_key, keyname, forenames, suffix, display_name,
+                       affiliations_json,
+                       lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
+                           AS display_name_normalized
+                FROM base_snapshot.authors
+                UNION ALL
+                SELECT author_key, keyname, forenames, suffix, display_name,
+                       affiliations_json,
+                       lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
+                           AS display_name_normalized
+                FROM read_parquet('{authors}')
                 """
             )
             connection.execute(
@@ -355,7 +366,14 @@ class DuckDBSnapshotBuilder:
                 f"CREATE TEMP VIEW source_deleted_records AS SELECT * FROM read_parquet('{deleted}')"
             )
             connection.execute(
-                f"CREATE TEMP VIEW source_authors AS SELECT * FROM read_parquet('{authors}')"
+                f"""
+                CREATE TEMP VIEW source_authors AS
+                SELECT author_key, keyname, forenames, suffix, display_name,
+                       affiliations_json,
+                       lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
+                           AS display_name_normalized
+                FROM read_parquet('{authors}')
+                """
             )
             connection.execute(
                 f"CREATE TEMP VIEW source_paper_authors AS SELECT * FROM read_parquet('{paper_authors}')"
@@ -450,14 +468,105 @@ class DuckDBSnapshotBuilder:
         )
         for table, column in (
             ("papers", "arxiv_id"),
+            ("papers", "doi"),
+            ("papers", "created"),
+            ("papers", "updated"),
             ("paper_versions", "arxiv_id"),
             ("paper_versions", "version"),
             ("authors", "author_key"),
+            ("authors", "display_name_normalized"),
+            ("paper_authors", "arxiv_id"),
+            ("paper_authors", "author_key"),
             ("categories", "category"),
+            ("categories", "arxiv_id"),
         ):
             connection.execute(
                 f"CREATE INDEX idx_{table}_{column} ON {table} ({column})"
             )
+
+    def _build_search_indexes(self, connection: duckdb.DuckDBPyConnection) -> None:
+        """Build structural search data and use DuckDB FTS when available."""
+
+        connection.execute(
+            """
+            CREATE VIEW current_papers AS
+            SELECT * FROM papers
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE paper_search AS
+            SELECT
+                arxiv_id,
+                concat_ws(' ',
+                    coalesce(title, ''),
+                    coalesce(abstract, ''),
+                    coalesce(comments, ''),
+                    coalesce(journal_ref, '')
+                ) AS search_text
+            FROM papers
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_paper_search_arxiv_id ON paper_search (arxiv_id)"
+        )
+
+        fts_enabled = False
+        try:
+            connection.execute("LOAD fts")
+            connection.execute(
+                """
+                PRAGMA create_fts_index(
+                    'paper_search', 'arxiv_id', 'search_text',
+                    stemmer='porter', stopwords='english', lower=1,
+                    strip_accents=1, overwrite=1
+                )
+                """
+            )
+            fts_enabled = True
+        except duckdb.Error:
+            # The extension is optional in the Python wheel. The normalized
+            # paper_search table remains available for a deterministic ILIKE
+            # fallback until the extension is installed locally.
+            fts_enabled = False
+
+        connection.execute(
+            """
+            CREATE TABLE search_metadata AS
+            SELECT * FROM (VALUES
+                ('fts_enabled', ?),
+                ('fts_stemmer', 'porter'),
+                ('fts_stopwords', 'english'),
+                ('search_fields', 'title,abstract,comments,journal_ref')
+            ) AS metadata(key, value)
+            """,
+            ["true" if fts_enabled else "false"],
+        )
+
+    @staticmethod
+    def _run_query_smoke_test(connection: duckdb.DuckDBPyConnection) -> None:
+        """Fail snapshot construction if the query schema is incomplete."""
+
+        required_tables = (
+            "papers",
+            "paper_versions",
+            "authors",
+            "paper_authors",
+            "categories",
+            "deleted_records",
+            "paper_search",
+            "search_metadata",
+        )
+        for table in required_tables:
+            row = connection.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_catalog = current_database() "
+                "AND table_schema = 'main' AND table_name = ?",
+                [table],
+            ).fetchone()
+            if row is None or int(row[0]) != 1:
+                raise RuntimeError(f"query snapshot smoke test missing table: {table}")
+        connection.execute("SELECT count(*) FROM current_papers").fetchone()
 
     @staticmethod
     def _count(database_path: Path, table: str) -> int:

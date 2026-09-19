@@ -38,12 +38,17 @@ metadata；这些字段只在 `is_current = true` 的当前版本行提供。
 data/parquet/full/<run-id>/paper_versions/
 data/parquet/incremental/<run-id>/paper_versions/
 data/duckdb/library-<run-id>.duckdb
+data/duckdb/current.json
 data/state/sync.duckdb
 ```
 
 `papers` 是去重、软删除后的当前论文视图；`paper_versions` 保留所有版本历史。
 增量同步会继承最近一次完成同步的 metadata prefix、set、创建时间范围和分类范围，
 并将这些参数写入 checkpoint，避免恢复时混用不同 scope。
+
+`duckdb/current.json` 是已完成查询校验的当前快照指针，由临时文件加原子替换发布。
+MCP 默认在每个请求边界检查该指针并切换 generation；显式指定 `--snapshot` 时固定使用
+指定文件。
 
 ## 常用命令
 
