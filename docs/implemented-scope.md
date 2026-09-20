@@ -59,6 +59,22 @@ uv run arxiv-papers sync status --data-dir data-cs-2023
 uv run arxiv-papers sync verify --data-dir data-cs-2023
 ```
 
+阶段 9 运维命令：
+
+```bash
+uv run arxiv-papers ops health --data-dir data-cs-2023 --sync-name incremental
+uv run arxiv-papers ops integrity --data-dir data-cs-2023
+uv run arxiv-papers ops backup --data-dir data-cs-2023 --output-dir backups
+uv run arxiv-papers ops compact \
+  --source data-cs-2023/parquet/full/<run-id>
+uv run arxiv-papers ops schedule --data-dir data-cs-2023 --hour 2 --minute 0
+```
+
+同步支持 `--log-file` 输出 JSONL 结构化日志；同步结果中的 `stats` 包含请求、重试、
+响应字节数、错误数、记录计数和耗时。健康检查和完整性检查只读本地状态、Parquet
+metadata 与当前 DuckDB 快照，不会请求 arXiv。详细运维策略见
+`docs/phase-9-operations.md`。
+
 如果终端使用的是本机代理但代理没有通过环境变量传给 Python，可以显式指定：
 
 ```bash

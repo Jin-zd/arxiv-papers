@@ -129,6 +129,26 @@ class OAIPage:
     elapsed_seconds: float | None = None
 
 
+@dataclass(slots=True)
+class OAIClientMetrics:
+    """Process-local counters for one OAI client instance."""
+
+    requests: int = 0
+    retries: int = 0
+    response_bytes: int = 0
+    transport_errors: int = 0
+    http_errors: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "requests": self.requests,
+            "retries": self.retries,
+            "response_bytes": self.response_bytes,
+            "transport_errors": self.transport_errors,
+            "http_errors": self.http_errors,
+        }
+
+
 def _local_name(element: etree._Element) -> str:
     """Return an XML element's local name, independent of its namespace."""
 
@@ -195,6 +215,7 @@ class OAIClient:
         )
         self._on_bytes_received = on_bytes_received
         self._last_request_at: float | None = None
+        self.metrics = OAIClientMetrics()
 
     def __enter__(self) -> Self:
         return self
@@ -284,11 +305,13 @@ class OAIClient:
             try:
                 response = self._request_buffered(params)
             except httpx.RequestError as exc:
+                self.metrics.transport_errors += 1
                 if attempt == attempts:
                     raise OAITransportError(
                         f"request failed after {attempt} attempts: {exc}"
                     ) from exc
                 delay = self._backoff_delay(attempt)
+                self.metrics.retries += 1
                 LOGGER.warning(
                     "oai_request_retry",
                     extra={
@@ -308,6 +331,8 @@ class OAIClient:
                     )
                 return response
 
+            self.metrics.http_errors += 1
+
             if (
                 not self._is_retryable_status(response.status_code)
                 or attempt == attempts
@@ -326,6 +351,7 @@ class OAIClient:
                 else self._backoff_delay(attempt),
             )
             response.close()
+            self.metrics.retries += 1
             LOGGER.warning(
                 "oai_request_retry",
                 extra={
@@ -346,8 +372,10 @@ class OAIClient:
             "GET", self.config.endpoint, params=dict(params)
         ) as response:
             content = bytearray()
+            self.metrics.requests += 1
             for chunk in response.iter_bytes():
                 content.extend(chunk)
+                self.metrics.response_bytes += len(chunk)
                 if self._on_bytes_received is not None:
                     self._on_bytes_received(len(chunk))
                 if len(content) > self.config.max_response_bytes:
@@ -482,6 +510,7 @@ __all__ = [
     "OAIClient",
     "OAIClientConfig",
     "OAIClientError",
+    "OAIClientMetrics",
     "OAIHTTPError",
     "OAIPage",
     "OAIParseError",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -47,9 +48,24 @@ class SyncStats:
     parse_errors: int = 0
     warnings: int = 0
     token_recoveries: int = 0
+    requests: int = 0
+    retries: int = 0
+    response_bytes: int = 0
+    transport_errors: int = 0
+    http_errors: int = 0
+    duration_seconds: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    def update_client_metrics(self, client: OAIClient, started_at: float) -> None:
+        metrics = client.metrics
+        self.requests = metrics.requests
+        self.retries = metrics.retries
+        self.response_bytes = metrics.response_bytes
+        self.transport_errors = metrics.transport_errors
+        self.http_errors = metrics.http_errors
+        self.duration_seconds = round(time.monotonic() - started_at, 3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +151,7 @@ class FullSyncRunner:
             category_prefixes=scope.category_prefixes,
         )
         stats = SyncStats(run_id=context.run_id)
+        started_at = time.monotonic()
         parquet_root = self.data_dir / "parquet" / "full" / context.run_id
         store = ParquetBatchStore(parquet_root)
         run_date = datetime.now(UTC).date()
@@ -225,6 +242,7 @@ class FullSyncRunner:
                 self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
             )
             snapshot = self.snapshot_builder.build(parquet_root, snapshot_path)
+            stats.update_client_metrics(self.client, started_at)
             self.snapshot_catalog.publish(
                 snapshot.path,
                 generation=context.run_id,
@@ -252,6 +270,7 @@ class FullSyncRunner:
             LOGGER.info("full_sync_finished", extra=result.as_dict())
             return result
         except Exception as error:
+            stats.update_client_metrics(self.client, started_at)
             if self.progress is not None:
                 self.progress.finish(success=False)
             self.state_store.mark_failed(run_id=context.run_id, error=str(error))
@@ -490,6 +509,7 @@ class IncrementalSyncRunner(FullSyncRunner):
             initial_datestamp=base_state.last_successful_datestamp,
         )
         stats = SyncStats(run_id=context.run_id)
+        started_at = time.monotonic()
         parquet_root = self.data_dir / "parquet" / "incremental" / context.run_id
         store = ParquetBatchStore(parquet_root)
         run_date = datetime.now(UTC).date()
@@ -562,6 +582,7 @@ class IncrementalSyncRunner(FullSyncRunner):
             snapshot = self.snapshot_builder.build(
                 parquet_root, snapshot_path, base_snapshot=base_snapshot
             )
+            stats.update_client_metrics(self.client, started_at)
             self.snapshot_catalog.publish(
                 snapshot.path,
                 generation=context.run_id,
@@ -589,6 +610,7 @@ class IncrementalSyncRunner(FullSyncRunner):
                 resumed=context.resumed,
             )
         except Exception as error:
+            stats.update_client_metrics(self.client, started_at)
             if self.progress is not None:
                 self.progress.finish(success=False)
             self.state_store.mark_failed(
