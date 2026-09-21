@@ -25,9 +25,10 @@ with DuckDBQueryService("data-cs-2023/duckdb/library-<run-id>.duckdb") as query:
 - `search_by_category`：精确分类检索，分类以 `.` 结尾时按前缀检索；
 - `get_paper`：按 arXiv ID 返回当前 metadata、作者、分类和版本事实；
 - `get_paper_by_doi`：大小写不敏感的精确 DOI 查询；
-- 所有列表查询默认按相关度、更新时间、arXiv ID 稳定排序，`limit` 最大为 100。
+- 所有列表查询默认按相关度、更新时间、arXiv ID 稳定排序，`limit` 最大为 100；
+  使用 keyset position 翻页，不执行深度 `OFFSET` 和精确总数统计。
 
-列表结果只来自 `papers` 当前版本表，因此不会返回已被 OAI-PMH deleted record 软删除的论文。`get_paper` 的版本列表来自 `paper_versions`，保留同步到本地的历史版本事实。
+列表结果只来自 `papers` 当前版本表，因此不会返回已被 OAI-PMH deleted record 软删除的论文。`get_paper` 的版本列表来自 `paper_versions`，保留同步到本地的历史版本事实。传入历史版本时，论文主体仍返回当前 metadata，同时通过 `selected_version` 返回指定版本事实。
 
 ## 索引和全文检索
 

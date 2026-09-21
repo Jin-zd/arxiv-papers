@@ -20,6 +20,19 @@ class SnapshotCatalogError(RuntimeError):
     """Raised when a local snapshot catalog cannot be read or published."""
 
 
+_BASE_SNAPSHOT_TABLES = (
+    "papers",
+    "paper_versions",
+    "authors",
+    "paper_authors",
+    "categories",
+    "deleted_records",
+    "library_metadata",
+)
+_SEARCH_SNAPSHOT_TABLES = ("paper_search", "search_metadata")
+_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"2", "3"})
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotPointer:
     """The atomically published local query generation."""
@@ -112,7 +125,7 @@ class SnapshotCatalog:
             raise SnapshotCatalogError(
                 "published snapshots must be stored in the DuckDB snapshot directory"
             )
-        self._validate_snapshot(source_path)
+        self.validate_snapshot(source_path)
         self.duckdb_dir.mkdir(parents=True, exist_ok=True)
         pointer = SnapshotPointer(
             generation=generation,
@@ -159,35 +172,47 @@ class SnapshotCatalog:
         return tuple(removed)
 
     @staticmethod
-    def _validate_snapshot(snapshot_path: Path) -> None:
+    def validate_snapshot(snapshot_path: Path | str) -> None:
+        """Validate that a DuckDB file is a usable query snapshot."""
+
+        snapshot_path = Path(snapshot_path)
         try:
             with duckdb.connect(str(snapshot_path), read_only=True) as connection:
-                required_tables = (
-                    "papers",
-                    "paper_versions",
-                    "authors",
-                    "paper_authors",
-                    "categories",
-                    "deleted_records",
-                    "paper_search",
-                    "search_metadata",
-                )
-                for table in required_tables:
-                    row = connection.execute(
-                        "SELECT count(*) FROM information_schema.tables "
-                        "WHERE table_schema = 'main' AND table_name = ?",
-                        [table],
-                    ).fetchone()
-                    if row is None or int(row[0]) != 1:
-                        raise SnapshotCatalogError(
-                            f"snapshot is missing required table: {table}"
-                        )
+                available = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'main'"
+                    ).fetchall()
+                }
+                missing = [
+                    table for table in _BASE_SNAPSHOT_TABLES if table not in available
+                ]
+                if missing:
+                    raise SnapshotCatalogError(
+                        f"snapshot is missing required table: {missing[0]}"
+                    )
                 metadata = connection.execute(
                     "SELECT value FROM library_metadata WHERE key = 'schema_version'"
                 ).fetchone()
                 if metadata is None:
                     raise SnapshotCatalogError("snapshot is missing schema metadata")
-                connection.execute("SELECT count(*) FROM current_papers").fetchone()
+                schema_version = str(metadata[0])
+                if schema_version not in _SUPPORTED_SNAPSHOT_SCHEMAS:
+                    raise SnapshotCatalogError(
+                        f"snapshot uses unsupported schema version: {schema_version}"
+                    )
+                if schema_version == "3":
+                    missing_search = [
+                        table
+                        for table in _SEARCH_SNAPSHOT_TABLES
+                        if table not in available
+                    ]
+                    if missing_search:
+                        raise SnapshotCatalogError(
+                            f"snapshot is missing required table: {missing_search[0]}"
+                        )
+                    connection.execute("SELECT count(*) FROM current_papers").fetchone()
         except duckdb.Error as error:
             raise SnapshotCatalogError(
                 f"snapshot failed read-only validation: {snapshot_path}"

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import threading
 from collections.abc import Mapping
 from datetime import date, datetime
@@ -15,7 +16,12 @@ from typing import Any
 import duckdb
 from mcp.server.mcpserver import MCPServer
 
-from arxiv_papers.query import DuckDBQueryService, QueryError, SearchPage
+from arxiv_papers.query import (
+    DuckDBQueryService,
+    QueryError,
+    SearchPage,
+    SearchPosition,
+)
 from arxiv_papers.snapshots import SnapshotCatalog, SnapshotCatalogError
 
 LOGGER = logging.getLogger(__name__)
@@ -122,6 +128,19 @@ class LocalArxivMCPServer:
         self._generation = pointer.generation
         previous.close()
 
+    def _cursor_fingerprint(self, filters: Mapping[str, object]) -> str:
+        payload = {
+            **filters,
+            "snapshot": self._snapshot_identity(),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _snapshot_identity(self) -> str:
+        return self._generation or str(self.snapshot_path.resolve())
+
     def search_papers(
         self,
         query: str | None = None,
@@ -137,21 +156,21 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers using keyword and structured filters."""
 
-        fingerprint = _cursor_fingerprint(
-            {
-                "query": query,
-                "author": author,
-                "category": category,
-                "primary_only": primary_only,
-                "created_from": created_from,
-                "created_until": created_until,
-                "updated_from": updated_from,
-                "updated_until": updated_until,
-            }
-        )
-        offset = _decode_cursor(cursor, fingerprint)
         with self._query_lock:
             self._refresh_snapshot_locked()
+            fingerprint = self._cursor_fingerprint(
+                {
+                    "query": query,
+                    "author": author,
+                    "category": category,
+                    "primary_only": primary_only,
+                    "created_from": created_from,
+                    "created_until": created_until,
+                    "updated_from": updated_from,
+                    "updated_until": updated_until,
+                }
+            )
+            after = _decode_cursor(cursor, fingerprint)
             page = self.query.search_papers(
                 query=query,
                 author=author,
@@ -162,7 +181,7 @@ class LocalArxivMCPServer:
                 updated_from=updated_from,
                 updated_until=updated_until,
                 limit=limit,
-                offset=offset,
+                after=after,
             )
         return _page_payload(page, fingerprint)
 
@@ -182,11 +201,11 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers by normalized author display name."""
 
-        fingerprint = _cursor_fingerprint({"author": author})
-        offset = _decode_cursor(cursor, fingerprint)
         with self._query_lock:
             self._refresh_snapshot_locked()
-            page = self.query.search_by_author(author, limit=limit, offset=offset)
+            fingerprint = self._cursor_fingerprint({"author": author})
+            after = _decode_cursor(cursor, fingerprint)
+            page = self.query.search_by_author(author, limit=limit, after=after)
         return _page_payload(page, fingerprint)
 
     def search_by_category(
@@ -198,17 +217,17 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers by exact category or category prefix."""
 
-        fingerprint = _cursor_fingerprint(
-            {"category": category, "primary_only": primary_only}
-        )
-        offset = _decode_cursor(cursor, fingerprint)
         with self._query_lock:
             self._refresh_snapshot_locked()
+            fingerprint = self._cursor_fingerprint(
+                {"category": category, "primary_only": primary_only}
+            )
+            after = _decode_cursor(cursor, fingerprint)
             page = self.query.search_by_category(
                 category,
                 primary_only=primary_only,
                 limit=limit,
-                offset=offset,
+                after=after,
             )
         return _page_payload(page, fingerprint)
 
@@ -338,44 +357,58 @@ def _same_path(left: Path, right: Path) -> bool:
 
 def _page_payload(page: SearchPage, fingerprint: str) -> dict[str, Any]:
     items = [_jsonable(item) for item in page.items]
-    next_cursor = None
-    if page.total is not None and page.offset + len(items) < page.total:
-        next_cursor = _encode_cursor(page.offset + len(items), fingerprint)
+    next_cursor = (
+        _encode_cursor(page.next_position, fingerprint)
+        if page.has_more and page.next_position is not None
+        else None
+    )
     return {
         "items": items,
         "limit": page.limit,
-        "total": page.total,
+        "has_more": page.has_more,
         "next_cursor": next_cursor,
     }
 
 
-def _cursor_fingerprint(filters: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        filters, ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _encode_cursor(offset: int, fingerprint: str) -> str:
+def _encode_cursor(position: SearchPosition, fingerprint: str) -> str:
     payload = json.dumps(
-        {"offset": offset, "fingerprint": fingerprint},
+        {
+            "fingerprint": fingerprint,
+            "position": {
+                "relevance": position.relevance,
+                "updated": position.updated.isoformat()
+                if position.updated is not None
+                else None,
+                "arxiv_id": position.arxiv_id,
+            },
+        },
         separators=(",", ":"),
     ).encode("ascii")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def _decode_cursor(cursor: str | None, fingerprint: str) -> int:
+def _decode_cursor(cursor: str | None, fingerprint: str) -> SearchPosition | None:
     if cursor is None:
-        return 0
+        return None
     try:
         padding = "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode("ascii"))
         if payload.get("fingerprint") != fingerprint:
             raise ValueError
-        offset = payload["offset"]
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        position = payload["position"]
+        relevance = position["relevance"]
+        if (
+            isinstance(relevance, bool)
+            or not isinstance(relevance, (int, float))
+            or not math.isfinite(float(relevance))
+        ):
             raise ValueError
-        return offset
+        updated = position["updated"]
+        parsed_updated = date.fromisoformat(updated) if updated is not None else None
+        arxiv_id = position["arxiv_id"]
+        if not isinstance(arxiv_id, str) or not arxiv_id:
+            raise ValueError
+        return SearchPosition(float(relevance), parsed_updated, arxiv_id)
     except (
         ValueError,
         KeyError,

@@ -496,18 +496,10 @@ class SyncStateStore:
         return _state_from_row(row) if row else None
 
     def status(self, sync_name: str | None = None) -> dict[str, object]:
-        state = self.get_state(sync_name) if sync_name else None
-        result: dict[str, object] = {
-            "state_path": str(self.path),
-            "state": _state_to_dict(state) if state else None,
-        }
         with duckdb.connect(str(self.path), read_only=True) as connection:
             state_rows = connection.execute(
                 f"SELECT {_STATE_COLUMNS} FROM sync_state ORDER BY sync_name"
             ).fetchall()
-            result["states"] = [
-                _state_to_dict(_state_from_row(row)) for row in state_rows
-            ]
             batch_rows = connection.execute(
                 """
                 SELECT status, count(*) AS count
@@ -516,14 +508,23 @@ class SyncStateStore:
                 ORDER BY status
                 """
             ).fetchall()
-            result["batches"] = [
-                {"status": str(row[0]), "count": int(row[1])} for row in batch_rows
-            ]
             dead_letter_row = connection.execute(
                 "SELECT count(*) FROM dead_letters"
             ).fetchone()
-            result["dead_letters"] = int(dead_letter_row[0]) if dead_letter_row else 0
-        return result
+        states = [_state_from_row(row) for row in state_rows]
+        selected = next(
+            (state for state in states if state and state.sync_name == sync_name),
+            None,
+        )
+        return {
+            "state_path": str(self.path),
+            "state": _state_to_dict(selected),
+            "states": [_state_to_dict(state) for state in states if state],
+            "batches": [
+                {"status": str(row[0]), "count": int(row[1])} for row in batch_rows
+            ],
+            "dead_letters": int(dead_letter_row[0]) if dead_letter_row else 0,
+        }
 
     def verify(self, sync_name: str = "full") -> dict[str, object]:
         state = self.get_state(sync_name)

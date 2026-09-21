@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import duckdb
 import pytest
 from test_query import QUERY_PAGE, build_query_snapshot
 
@@ -55,6 +56,27 @@ def test_snapshot_catalog_current_pointer_is_atomic_file(tmp_path: Path) -> None
     assert '"generation": "query-run"' in pointer_text
     assert not tuple(catalog.duckdb_dir.glob(".current.json.*.tmp"))
     assert catalog.current_snapshot() == snapshot
+
+
+def test_snapshot_catalog_validates_legacy_schema_two_snapshot(tmp_path: Path) -> None:
+    snapshot = tmp_path / "duckdb" / "library-legacy.duckdb"
+    snapshot.parent.mkdir(parents=True)
+    with duckdb.connect(str(snapshot)) as connection:
+        for table in (
+            "papers",
+            "paper_versions",
+            "authors",
+            "paper_authors",
+            "categories",
+            "deleted_records",
+        ):
+            connection.execute(f"CREATE TABLE {table} (id INTEGER)")
+        connection.execute("CREATE TABLE library_metadata (key VARCHAR, value VARCHAR)")
+        connection.execute(
+            "INSERT INTO library_metadata VALUES ('schema_version', '2')"
+        )
+
+    SnapshotCatalog.validate_snapshot(snapshot)
 
 
 def test_snapshot_catalog_supports_switching_generations(tmp_path: Path) -> None:

@@ -20,7 +20,6 @@ from lxml import etree  # pyright: ignore[reportAttributeAccessIssue]
 
 LOGGER = logging.getLogger(__name__)
 
-OAI_NS: Final = "http://www.openarchives.org/OAI/2.0/"
 DEFAULT_ENDPOINT: Final = "https://oaipmh.arxiv.org/oai"
 DEFAULT_METADATA_PREFIX: Final = "arXivRaw"
 DEFAULT_USER_AGENT: Final = "arxiv-papers/0.1.0"

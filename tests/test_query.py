@@ -64,6 +64,13 @@ QUERY_PAGE = b"""<?xml version="1.0" encoding="UTF-8"?>
   </ListRecords>
 </OAI-PMH>"""
 
+VERSIONED_QUERY_PAGE = QUERY_PAGE.replace(
+    b"<created>2024-01-02</created>",
+    b'<version version="v1"><date>Tue, 02 Jan 2024 05:00:00 GMT</date></version>'
+    b'<version version="v2"><date>Sat, 03 Feb 2024 05:00:00 GMT</date></version>'
+    b"<created>2024-01-02</created>",
+)
+
 
 def build_query_snapshot(
     tmp_path: Path,
@@ -115,7 +122,7 @@ def test_query_snapshot_has_search_tables_and_structural_indexes(
 def test_search_by_text_author_category_and_date(query_service) -> None:
     text_results = query_service.search_papers(query="ranking")
     assert [item["arxiv_id"] for item in text_results.items] == ["2401.00001"]
-    assert text_results.total == 1
+    assert text_results.has_more is False
 
     author_results = query_service.search_by_author("  JANE   DOE ")
     assert [item["arxiv_id"] for item in author_results.items] == ["2401.00001"]
@@ -124,7 +131,6 @@ def test_search_by_text_author_category_and_date(query_service) -> None:
     category_results = query_service.search_by_category("cs.AI")
     assert [item["arxiv_id"] for item in category_results.items] == ["2401.00001"]
     prefix_results = query_service.search_by_category("cs.")
-    assert prefix_results.total == 2
     assert [item["arxiv_id"] for item in prefix_results.items] == [
         "2401.00001",
         "2401.00002",
@@ -134,6 +140,33 @@ def test_search_by_text_author_category_and_date(query_service) -> None:
         created_from="2024-01-03", updated_until="2024-02-03"
     )
     assert [item["arxiv_id"] for item in date_results.items] == ["2401.00002"]
+
+
+def test_keyset_pagination_has_no_duplicates_or_total(query_service) -> None:
+    first = query_service.search_by_category("cs.", limit=1)
+    assert first.has_more is True
+    assert first.next_position is not None
+    assert not hasattr(first, "total")
+
+    second = query_service.search_by_category("cs.", limit=1, after=first.next_position)
+    assert [item["arxiv_id"] for item in first.items + second.items] == [
+        "2401.00001",
+        "2401.00002",
+    ]
+    assert second.has_more is False
+
+
+def test_get_historical_version_keeps_current_metadata(tmp_path: Path) -> None:
+    snapshot_path = build_query_snapshot(tmp_path, page=VERSIONED_QUERY_PAGE)
+    with DuckDBQueryService(snapshot_path) as service:
+        paper = service.get_paper("2401.00001", version=1)
+
+    assert paper is not None
+    assert paper["title"] == "Local Search Systems"
+    assert paper["version"] == 2
+    assert paper["selected_version"]["version"] == 1
+    assert paper["selected_version"]["is_current"] is False
+    assert len(paper["versions"]) == 2
 
 
 def test_get_paper_by_id_doi_and_version_facts(query_service) -> None:

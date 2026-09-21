@@ -68,12 +68,16 @@ uv run arxiv-papers ops backup --data-dir data-cs-2023 --output-dir backups
 uv run arxiv-papers ops compact \
   --source data-cs-2023/parquet/full/<run-id>
 uv run arxiv-papers ops schedule --data-dir data-cs-2023 --hour 2 --minute 0
+uv run arxiv-papers ops benchmark --data-dir data-cs-2023 --iterations 5 --limit 20
 ```
 
 同步支持 `--log-file` 输出 JSONL 结构化日志；同步结果中的 `stats` 包含请求、重试、
 响应字节数、错误数、记录计数和耗时。健康检查和完整性检查只读本地状态、Parquet
 metadata 与当前 DuckDB 快照，不会请求 arXiv。详细运维策略见
 `docs/phase-9-operations.md`。
+
+查询列表使用 keyset cursor，不返回精确 total；snapshot generation 变化后旧 cursor
+会失效。`get_paper` 支持查询指定历史版本，并在 `selected_version` 中返回版本事实。
 
 如果终端使用的是本机代理但代理没有通过环境变量传给 Python，可以显式指定：
 

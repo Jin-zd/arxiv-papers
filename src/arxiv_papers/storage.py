@@ -311,76 +311,59 @@ class DuckDBSnapshotBuilder:
         categories = _read_parquet_sql(root / "categories" / "*.parquet")
         deleted = _read_parquet_sql(root / "deleted_records" / "*.parquet")
 
+        self._create_source_views(
+            connection,
+            {
+                "paper_versions": paper_versions,
+                "deleted_records": deleted,
+                "authors": authors,
+                "paper_authors": paper_authors,
+                "categories": categories,
+            },
+            base_snapshot,
+        )
+
+    @staticmethod
+    def _create_source_views(
+        connection: duckdb.DuckDBPyConnection,
+        parquet_paths: dict[str, str],
+        base_snapshot: Path | str | None,
+    ) -> None:
         if base_snapshot is not None:
             base_path = _read_parquet_sql(Path(base_snapshot))
             connection.execute(f"ATTACH '{base_path}' AS base_snapshot (READ_ONLY)")
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_paper_versions AS
-                SELECT * FROM base_snapshot.paper_versions
-                UNION ALL SELECT * FROM read_parquet('{paper_versions}')
-                """
-            )
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_deleted_records AS
-                SELECT * FROM base_snapshot.deleted_records
-                UNION ALL SELECT * FROM read_parquet('{deleted}')
-                """
-            )
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_authors AS
+
+        for table_name in (
+            "paper_versions",
+            "deleted_records",
+            "paper_authors",
+            "categories",
+        ):
+            current = f"SELECT * FROM read_parquet('{parquet_paths[table_name]}')"
+            if base_snapshot is not None:
+                current = (
+                    f"SELECT * FROM base_snapshot.{table_name} UNION ALL {current}"
+                )
+            connection.execute(f"CREATE TEMP VIEW source_{table_name} AS {current}")
+
+        current_authors = f"""
+            SELECT author_key, keyname, forenames, suffix, display_name,
+                   affiliations_json,
+                   lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
+                       AS display_name_normalized
+            FROM read_parquet('{parquet_paths["authors"]}')
+        """
+        if base_snapshot is not None:
+            current_authors = f"""
                 SELECT author_key, keyname, forenames, suffix, display_name,
                        affiliations_json,
                        lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
                            AS display_name_normalized
                 FROM base_snapshot.authors
                 UNION ALL
-                SELECT author_key, keyname, forenames, suffix, display_name,
-                       affiliations_json,
-                       lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
-                           AS display_name_normalized
-                FROM read_parquet('{authors}')
-                """
-            )
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_paper_authors AS
-                SELECT * FROM base_snapshot.paper_authors
-                UNION ALL SELECT * FROM read_parquet('{paper_authors}')
-                """
-            )
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_categories AS
-                SELECT * FROM base_snapshot.categories
-                UNION ALL SELECT * FROM read_parquet('{categories}')
-                """
-            )
-        else:
-            connection.execute(
-                f"CREATE TEMP VIEW source_paper_versions AS SELECT * FROM read_parquet('{paper_versions}')"
-            )
-            connection.execute(
-                f"CREATE TEMP VIEW source_deleted_records AS SELECT * FROM read_parquet('{deleted}')"
-            )
-            connection.execute(
-                f"""
-                CREATE TEMP VIEW source_authors AS
-                SELECT author_key, keyname, forenames, suffix, display_name,
-                       affiliations_json,
-                       lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
-                           AS display_name_normalized
-                FROM read_parquet('{authors}')
-                """
-            )
-            connection.execute(
-                f"CREATE TEMP VIEW source_paper_authors AS SELECT * FROM read_parquet('{paper_authors}')"
-            )
-            connection.execute(
-                f"CREATE TEMP VIEW source_categories AS SELECT * FROM read_parquet('{categories}')"
-            )
+                {current_authors}
+            """
+        connection.execute(f"CREATE TEMP VIEW source_authors AS {current_authors}")
 
         connection.execute(
             """

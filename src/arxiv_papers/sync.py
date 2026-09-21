@@ -25,7 +25,7 @@ from arxiv_papers.metadata import (
 from arxiv_papers.oai import OAIClient, OAIPage, OAIProtocolError
 from arxiv_papers.progress import ProgressDisplay
 from arxiv_papers.snapshots import SnapshotCatalog
-from arxiv_papers.state import SyncStateStore, overlap_datestamp
+from arxiv_papers.state import SyncContext, SyncStateStore, overlap_datestamp
 from arxiv_papers.storage import (
     DuckDBSnapshotBuilder,
     ParquetBatchStore,
@@ -237,33 +237,14 @@ class FullSyncRunner:
                         scope=scope,
                     )
 
-            store.finalize()
-            snapshot_path = (
-                self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
-            )
-            snapshot = self.snapshot_builder.build(parquet_root, snapshot_path)
-            stats.update_client_metrics(self.client, started_at)
-            self.snapshot_catalog.publish(
-                snapshot.path,
-                generation=context.run_id,
-                counts={
-                    "paper_versions": snapshot.paper_versions,
-                    "papers": snapshot.papers,
-                    "authors": snapshot.authors,
-                    "categories": snapshot.categories,
-                    "deleted_records": snapshot.deleted_records,
-                },
-            )
-            self.state_store.mark_completed(
-                run_id=context.run_id, snapshot_path=snapshot.path
-            )
-            self.snapshot_catalog.prune()
-            result = FullSyncResult(
-                run_id=context.run_id,
-                stats=stats,
+            result = self._complete_run(
+                context=context,
                 parquet_root=parquet_root,
-                snapshot=snapshot,
-                resumed=context.resumed,
+                store=store,
+                base_snapshot=None,
+                stats=stats,
+                started_at=started_at,
+                sync_name="full",
             )
             if self.progress is not None:
                 self.progress.finish(success=True)
@@ -364,6 +345,48 @@ class FullSyncRunner:
                 self.progress.update(page, page_number=page_number)
             page_number += 1
         return page_number
+
+    def _complete_run(
+        self,
+        *,
+        context: SyncContext,
+        parquet_root: Path,
+        store: ParquetBatchStore,
+        base_snapshot: Path | None,
+        stats: SyncStats,
+        started_at: float,
+        sync_name: str,
+    ) -> FullSyncResult:
+        store.finalize()
+        snapshot_path = self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
+        snapshot = self.snapshot_builder.build(
+            parquet_root, snapshot_path, base_snapshot=base_snapshot
+        )
+        stats.update_client_metrics(self.client, started_at)
+        self.snapshot_catalog.publish(
+            snapshot.path,
+            generation=context.run_id,
+            counts={
+                "paper_versions": snapshot.paper_versions,
+                "papers": snapshot.papers,
+                "authors": snapshot.authors,
+                "categories": snapshot.categories,
+                "deleted_records": snapshot.deleted_records,
+            },
+        )
+        self.state_store.mark_completed(
+            run_id=context.run_id,
+            snapshot_path=snapshot.path,
+            sync_name=sync_name,
+        )
+        self.snapshot_catalog.prune()
+        return FullSyncResult(
+            run_id=context.run_id,
+            stats=stats,
+            parquet_root=parquet_root,
+            snapshot=snapshot,
+            resumed=context.resumed,
+        )
 
     def _parse_page_records(
         self,
@@ -575,40 +598,18 @@ class IncrementalSyncRunner(FullSyncRunner):
                         sync_name="incremental",
                     )
 
-            store.finalize()
-            snapshot_path = (
-                self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
-            )
-            snapshot = self.snapshot_builder.build(
-                parquet_root, snapshot_path, base_snapshot=base_snapshot
-            )
-            stats.update_client_metrics(self.client, started_at)
-            self.snapshot_catalog.publish(
-                snapshot.path,
-                generation=context.run_id,
-                counts={
-                    "paper_versions": snapshot.paper_versions,
-                    "papers": snapshot.papers,
-                    "authors": snapshot.authors,
-                    "categories": snapshot.categories,
-                    "deleted_records": snapshot.deleted_records,
-                },
-            )
-            self.state_store.mark_completed(
-                run_id=context.run_id,
-                snapshot_path=snapshot.path,
+            result = self._complete_run(
+                context=context,
+                parquet_root=parquet_root,
+                store=store,
+                base_snapshot=base_snapshot,
+                stats=stats,
+                started_at=started_at,
                 sync_name="incremental",
             )
-            self.snapshot_catalog.prune()
             if self.progress is not None:
                 self.progress.finish(success=True)
-            return FullSyncResult(
-                run_id=context.run_id,
-                stats=stats,
-                parquet_root=parquet_root,
-                snapshot=snapshot,
-                resumed=context.resumed,
-            )
+            return result
         except Exception as error:
             stats.update_client_metrics(self.client, started_at)
             if self.progress is not None:

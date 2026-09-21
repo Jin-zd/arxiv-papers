@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from arxiv_papers.mcp_server import (
     _encode_cursor,
     resolve_snapshot_path,
 )
+from arxiv_papers.query import SearchPosition
 from arxiv_papers.snapshots import SnapshotCatalog
 
 
@@ -38,7 +41,8 @@ def test_mcp_registers_read_only_tools_and_calls_local_query(tmp_path: Path) -> 
             )
         )
         assert result.structured_content is not None
-        assert result.structured_content["total"] == 1
+        assert result.structured_content["has_more"] is False
+        assert "total" not in result.structured_content
         assert result.structured_content["items"][0]["arxiv_id"] == "2401.00001"
 
         status = asyncio.run(application.server.call_tool("library_status", {}))
@@ -115,6 +119,8 @@ def test_mcp_switches_generation_at_request_boundary(tmp_path: Path) -> None:
         assert application.get_paper("2401.00001")["paper"]["title"] == (
             "Local Search Systems"
         )
+        first_page = application.search_by_category("cs.", limit=1)
+        assert first_page["next_cursor"]
         second_page = QUERY_PAGE.replace(
             b"Local Search Systems", b"A New Generation Search System"
         )
@@ -127,17 +133,20 @@ def test_mcp_switches_generation_at_request_boundary(tmp_path: Path) -> None:
             "A New Generation Search System"
         )
         assert application.snapshot_path == second
+        with pytest.raises(Exception, match="invalid or mismatched cursor"):
+            application.search_by_category(
+                "cs.", limit=1, cursor=first_page["next_cursor"]
+            )
     finally:
         application.close()
 
 
 def test_cursor_encoding_is_opaque_and_validated() -> None:
-    cursor = _encode_cursor(20, "fingerprint")
-    assert (
-        json.loads(__import__("base64").urlsafe_b64decode(cursor + "=="))["offset"]
-        == 20
-    )
-    assert _decode_cursor(cursor, "fingerprint") == 20
+    position = SearchPosition(1.25, date(2024, 2, 3), "2401.00001")
+    cursor = _encode_cursor(position, "fingerprint")
+    payload = json.loads(base64.urlsafe_b64decode(cursor + "=="))
+    assert payload["position"]["arxiv_id"] == "2401.00001"
+    assert _decode_cursor(cursor, "fingerprint") == position
     with pytest.raises(Exception, match="invalid or mismatched cursor"):
         _decode_cursor(cursor, "other")
 

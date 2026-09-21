@@ -85,7 +85,7 @@ def health_report(
         elif not pointer.snapshot_path.is_file():
             issues.append("current snapshot pointer targets a missing file")
         else:
-            SnapshotCatalog._validate_snapshot(pointer.snapshot_path)
+            SnapshotCatalog.validate_snapshot(pointer.snapshot_path)
             result["generation"] = pointer.generation
             result["snapshot"] = str(pointer.snapshot_path)
     except SnapshotCatalogError as error:
@@ -123,7 +123,7 @@ def integrity_report(data_dir: Path | str) -> dict[str, object]:
         if pointer is None or not pointer.snapshot_path.is_file():
             issues.append("current snapshot is missing")
         else:
-            SnapshotCatalog._validate_snapshot(pointer.snapshot_path)
+            SnapshotCatalog.validate_snapshot(pointer.snapshot_path)
             result["snapshot"] = _snapshot_counts(pointer.snapshot_path)
             result["generation"] = pointer.generation
             expected = pointer.counts
@@ -168,19 +168,11 @@ def compact_parquet(
             files = tuple(source.glob(f"{table_name}/*.parquet"))
             destination = temporary / table_name
             destination.mkdir(parents=True, exist_ok=True)
-            if files:
-                table = ds.dataset(
-                    [str(path) for path in files], format="parquet"
-                ).to_table()
-            else:
-                table = pa.Table.from_pylist([], schema=schema)
-            table = _coerce_schema(table, schema)
-            pq.write_table(
-                table,
+            table_counts[table_name] = _compact_table(
+                files,
                 destination / "part-000001.parquet",
-                compression="zstd",
+                schema,
             )
-            table_counts[table_name] = table.num_rows
         parse_errors = source / "parse-errors.jsonl"
         if parse_errors.is_file():
             shutil.copy2(parse_errors, temporary / parse_errors.name)
@@ -326,6 +318,33 @@ def _coerce_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
         else:
             columns.append(pa.nulls(table.num_rows, type=field.type))
     return pa.Table.from_arrays(columns, schema=schema)
+
+
+def _compact_table(files: tuple[Path, ...], output: Path, schema: pa.Schema) -> int:
+    if not files:
+        pq.write_table(
+            pa.Table.from_pylist([], schema=schema), output, compression="zstd"
+        )
+        return 0
+
+    row_count = 0
+    writer: pq.ParquetWriter | None = None
+    try:
+        dataset = ds.dataset([str(path) for path in files], format="parquet")
+        for batch in dataset.scanner(batch_size=65_536).to_batches():
+            table = _coerce_schema(pa.Table.from_batches([batch]), schema)
+            if writer is None:
+                writer = pq.ParquetWriter(output, schema, compression="zstd")
+            writer.write_table(table)
+            row_count += table.num_rows
+        if writer is None:
+            pq.write_table(
+                pa.Table.from_pylist([], schema=schema), output, compression="zstd"
+            )
+    finally:
+        if writer is not None:
+            writer.close()
+    return row_count
 
 
 def _file_digest(path: Path) -> tuple[str, int]:

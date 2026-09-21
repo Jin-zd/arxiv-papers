@@ -25,6 +25,6 @@ uv run arxiv-papers mcp \
 - `search_by_category`：分类精确或前缀检索；
 - `library_status`：返回快照 schema、论文数量、版本数量和 FTS 状态。
 
-列表工具使用不透明 `cursor` 分页。cursor 包含查询条件指纹，不能跨查询条件复用；服务端仍通过阶段 6 的稳定排序保证翻页结果一致。
+列表工具使用不透明 `cursor` 分页。cursor 包含查询条件、snapshot generation 和最后一条结果的排序位置，不能跨查询条件或 snapshot 复用；服务端使用 keyset pagination，响应包含 `items`、`limit`、`has_more` 和 `next_cursor`，不再计算精确 `total`。
 
 工具返回 JSON 结构，日期和时间统一转换为 ISO 8601 字符串。无结果返回空 `items` 或 `paper: null`，参数错误会以 MCP tool error 返回。

@@ -20,13 +20,22 @@ class SnapshotNotFoundError(QueryError):
 
 
 @dataclass(frozen=True, slots=True)
+class SearchPosition:
+    """The final sort position needed for keyset pagination."""
+
+    relevance: float
+    updated: date | None
+    arxiv_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class SearchPage:
-    """A stable, offset-based page of current-paper search results."""
+    """A stable keyset-paginated page of current-paper search results."""
 
     items: tuple[dict[str, object], ...]
     limit: int
-    offset: int
-    total: int | None = None
+    has_more: bool
+    next_position: SearchPosition | None = None
 
 
 class DuckDBQueryService:
@@ -68,11 +77,11 @@ class DuckDBQueryService:
         updated_from: date | str | None = None,
         updated_until: date | str | None = None,
         limit: int = 20,
-        offset: int = 0,
+        after: SearchPosition | None = None,
     ) -> SearchPage:
         """Search current, non-deleted papers with stable relevance ordering."""
 
-        limit, offset = _validate_page(limit, offset, self.MAX_LIMIT)
+        limit = _validate_limit(limit, self.MAX_LIMIT)
         normalized_query = query.strip() if query else None
         conditions = ["1 = 1"]
         parameters: list[object] = []
@@ -134,13 +143,13 @@ class DuckDBQueryService:
         author_list = (
             "COALESCE((SELECT list(a.display_name ORDER BY pa.author_order) "
             "FROM paper_authors pa JOIN authors a ON a.author_key = pa.author_key "
-            "WHERE pa.arxiv_id = p.arxiv_id "
-            "AND pa.version IS NOT DISTINCT FROM p.version), [])"
+            "WHERE pa.arxiv_id = w.arxiv_id "
+            "AND pa.version IS NOT DISTINCT FROM w.version), [])"
         )
         category_list = (
             "COALESCE((SELECT list(c.category ORDER BY c.is_primary DESC, c.category) "
-            "FROM categories c WHERE c.arxiv_id = p.arxiv_id "
-            "AND c.version IS NOT DISTINCT FROM p.version), [])"
+            "FROM categories c WHERE c.arxiv_id = w.arxiv_id "
+            "AND c.version IS NOT DISTINCT FROM w.version), [])"
         )
         from_sql = "papers p"
         if normalized_query and self.fts_enabled:
@@ -151,38 +160,102 @@ class DuckDBQueryService:
                 "FROM paper_search"
                 ") search_score ON search_score.arxiv_id = p.arxiv_id"
             )
+        position_condition = "1 = 1"
+        position_parameters: list[object] = []
+        if after is not None:
+            position_condition = """
+                (
+                    ranked.relevance < ?
+                    OR (
+                        ranked.relevance = ?
+                        AND (
+                            ranked.updated_is_null > ?
+                            OR (
+                                ranked.updated_is_null = ?
+                                AND (
+                                    ranked.updated < ?
+                                    OR (
+                                        ranked.updated IS NOT DISTINCT FROM ?
+                                        AND ranked.arxiv_id > ?
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            """
+            position_parameters.extend(
+                [
+                    after.relevance,
+                    after.relevance,
+                    int(after.updated is None),
+                    int(after.updated is None),
+                    after.updated,
+                    after.updated,
+                    after.arxiv_id,
+                ]
+            )
+
         sql = f"""
-            SELECT p.arxiv_id, p.version, p.title, p.abstract, p.created,
-                   p.updated, p.doi, p.journal_ref, p.comments,
-                   p.primary_category, {author_list} AS authors,
-                   {category_list} AS categories, {score_sql} AS relevance,
-                   count(*) OVER () AS total_count
-            FROM {from_sql}
-            WHERE {where_sql}
-            ORDER BY relevance DESC NULLS LAST, p.updated DESC NULLS LAST,
-                     p.arxiv_id ASC
-            LIMIT ? OFFSET ?
+            WITH ranked AS (
+                SELECT p.arxiv_id, p.version, p.title, p.abstract, p.created,
+                       p.updated, p.doi, p.journal_ref, p.comments,
+                       p.primary_category, {score_sql} AS relevance,
+                       CASE WHEN p.updated IS NULL THEN 1 ELSE 0 END
+                           AS updated_is_null
+                FROM {from_sql}
+                WHERE {where_sql}
+            ), windowed AS (
+                SELECT *
+                FROM ranked
+                WHERE {position_condition}
+                ORDER BY relevance DESC NULLS LAST,
+                         updated_is_null ASC,
+                         updated DESC NULLS LAST,
+                         arxiv_id ASC
+                LIMIT ?
+            )
+            SELECT w.arxiv_id, w.version, w.title, w.abstract, w.created,
+                   w.updated, w.doi, w.journal_ref, w.comments,
+                   w.primary_category, {author_list} AS authors,
+                   {category_list} AS categories,
+                   w.relevance
+            FROM windowed w
+            ORDER BY w.relevance DESC NULLS LAST,
+                     w.updated_is_null ASC,
+                     w.updated DESC NULLS LAST,
+                     w.arxiv_id ASC
         """
-        parameters.extend([limit, offset])
+        parameters.extend(position_parameters)
+        parameters.append(limit + 1)
         rows = self.connection.execute(sql, parameters).fetchall()
         columns = [item[0] for item in self.connection.description]
+        has_more = len(rows) > limit
+        rows = rows[:limit]
         item_columns = columns[:-1]
-        total = int(rows[0][-1]) if rows else 0
+        next_position = None
+        if has_more and rows:
+            last_row = rows[-1]
+            next_position = SearchPosition(
+                relevance=float(last_row[-1]),
+                updated=last_row[5],
+                arxiv_id=str(last_row[0]),
+            )
         return SearchPage(
             items=tuple(_row_to_dict(item_columns, row[:-1]) for row in rows),
             limit=limit,
-            offset=offset,
-            total=total,
+            has_more=has_more,
+            next_position=next_position,
         )
 
     def search_by_author(
-        self, author: str, *, limit: int = 20, offset: int = 0
+        self, author: str, *, limit: int = 20, after: SearchPosition | None = None
     ) -> SearchPage:
         """Search papers by normalized author name, independent of FTS."""
 
         if not author.strip():
             raise QueryError("author must not be empty")
-        return self.search_papers(author=author, limit=limit, offset=offset)
+        return self.search_papers(author=author, limit=limit, after=after)
 
     def search_by_category(
         self,
@@ -190,7 +263,7 @@ class DuckDBQueryService:
         *,
         primary_only: bool = False,
         limit: int = 20,
-        offset: int = 0,
+        after: SearchPosition | None = None,
     ) -> SearchPage:
         """Search papers by exact category or a trailing-dot prefix."""
 
@@ -200,7 +273,7 @@ class DuckDBQueryService:
             category=category.strip(),
             primary_only=primary_only,
             limit=limit,
-            offset=offset,
+            after=after,
         )
 
     def get_paper(
@@ -211,25 +284,27 @@ class DuckDBQueryService:
         canonical_id = arxiv_id.strip()
         if not canonical_id:
             raise QueryError("arxiv_id must not be empty")
-        condition = "arxiv_id = ?"
         parameters: list[object] = [canonical_id]
-        if version is not None:
-            if version < 1:
-                raise QueryError("version must be positive")
-            condition += " AND version = ?"
-            parameters.append(version)
+        if version is not None and version < 1:
+            raise QueryError("version must be positive")
         row = self.connection.execute(
-            f"SELECT * FROM papers WHERE {condition} LIMIT 1", parameters
+            "SELECT * FROM papers WHERE arxiv_id = ? LIMIT 1", parameters
         ).fetchone()
         if row is None:
             return None
         columns = [item[0] for item in self.connection.description]
         paper = _row_to_dict(columns, row)
-        paper_version = paper["version"]
-        if paper_version is not None:
-            paper_version = int(paper_version)
-        paper["authors"] = self._authors(canonical_id, paper_version)
-        paper["categories"] = self._categories(canonical_id, paper_version)
+        current_version = paper["version"]
+        if current_version is not None:
+            current_version = int(current_version)
+        selected_version = self._version(
+            canonical_id, current_version if version is None else version
+        )
+        if selected_version is None:
+            return None
+        paper["selected_version"] = selected_version
+        paper["authors"] = self._authors(canonical_id, current_version)
+        paper["categories"] = self._categories(canonical_id, current_version)
         paper["versions"] = self._versions(canonical_id)
         return paper
 
@@ -291,6 +366,22 @@ class DuckDBQueryService:
         columns = [item[0] for item in self.connection.description]
         return [_row_to_dict(columns, row) for row in rows]
 
+    def _version(self, arxiv_id: str, version: int | None) -> dict[str, object] | None:
+        row = self.connection.execute(
+            """
+            SELECT arxiv_id, version, first_submitted_at, submitted_at,
+                   size_kb, source_type, is_current, oai_datestamp
+            FROM paper_versions
+            WHERE arxiv_id = ? AND version IS NOT DISTINCT FROM ?
+            LIMIT 1
+            """,
+            [arxiv_id, version],
+        ).fetchone()
+        if row is None:
+            return None
+        columns = [item[0] for item in self.connection.description]
+        return _row_to_dict(columns, row)
+
     def _read_fts_enabled(self) -> bool:
         try:
             row = self.connection.execute(
@@ -314,12 +405,10 @@ class DuckDBQueryService:
         return "lower(regexp_replace(trim(a.display_name), '\\s+', ' ', 'g'))"
 
 
-def _validate_page(limit: int, offset: int, max_limit: int) -> tuple[int, int]:
+def _validate_limit(limit: int, max_limit: int) -> int:
     if limit < 1 or limit > max_limit:
         raise QueryError(f"limit must be between 1 and {max_limit}")
-    if offset < 0:
-        raise QueryError("offset must be non-negative")
-    return limit, offset
+    return limit
 
 
 def _normalize_search_text(value: str) -> str:
@@ -343,5 +432,6 @@ __all__ = [
     "DuckDBQueryService",
     "QueryError",
     "SearchPage",
+    "SearchPosition",
     "SnapshotNotFoundError",
 ]

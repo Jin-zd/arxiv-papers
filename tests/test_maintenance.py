@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 from test_query import QUERY_PAGE, build_query_snapshot
 
+from arxiv_papers.benchmark import benchmark_snapshot
 from arxiv_papers.logging_config import JsonFormatter
 from arxiv_papers.maintenance import (
     MaintenanceError,
@@ -103,17 +105,21 @@ def test_compact_parquet_writes_readable_copy_without_changing_source(
 ) -> None:
     build_query_snapshot(tmp_path)
     source = tmp_path / "parquet" / "full" / "query-run"
+    shutil.copy2(
+        source / "paper_versions" / "part-000001.parquet",
+        source / "paper_versions" / "part-000002.parquet",
+    )
     source_files = sorted(source.rglob("*.parquet"))
     output = tmp_path / "compacted" / "run"
 
     result = compact_parquet(source, output)
 
     assert result.output == output
-    assert result.tables["paper_versions"] == 2
+    assert result.tables["paper_versions"] == 4
     assert result.files_written == 5
     assert sorted(source.rglob("*.parquet")) == source_files
     assert (
-        pq.read_table(output / "paper_versions" / "part-000001.parquet").num_rows == 2
+        pq.read_table(output / "paper_versions" / "part-000001.parquet").num_rows == 4
     )
 
 
@@ -158,3 +164,16 @@ def test_scheduler_plan_and_time_validation(tmp_path: Path) -> None:
         scheduler_plan(tmp_path, hour=24)
     with pytest.raises(MaintenanceError, match="minute"):
         scheduler_plan(tmp_path, minute=60)
+
+
+def test_benchmark_is_read_only_and_reports_query_shapes(tmp_path: Path) -> None:
+    snapshot = build_query_snapshot(tmp_path)
+    pointer_before = (tmp_path / "duckdb" / "current.json").read_bytes()
+
+    report = benchmark_snapshot(snapshot, iterations=2, limit=1)
+
+    assert report["snapshot"] == str(snapshot)
+    assert report["iterations"] == 2
+    assert {"keyword", "author", "category", "id"} <= set(report["cases"])
+    assert report["cases"]["keyword"]["median_ms"] >= 0
+    assert (tmp_path / "duckdb" / "current.json").read_bytes() == pointer_before
