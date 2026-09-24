@@ -38,6 +38,8 @@ with DuckDBQueryService("data-cs-2023/duckdb/library-<run-id>.duckdb") as query:
 
 如果扩展不可用，构建不会失败，查询层会自动回退到这四个字段的 `ILIKE` 检索。回退模式仍然完全本地执行；`search_metadata` 中的 `fts_enabled` 记录当前快照采用的模式。
 
-## 增量基线兼容
+## 快照 schema
 
-阶段 6 将快照 schema 更新为 `3`。已有阶段 5 的 schema `2`（已包含 `arXivRaw` 版本历史）可以作为增量同步基线；下一次构建会生成 schema `3` 并加入查询索引。旧快照本身也可以由 `DuckDBQueryService` 以 ILIKE 回退模式读取。
+当前查询快照使用 schema `4`，并要求包含物化的 `paper_details` 表。`get_paper` 和批量详情查询只使用该表的一次详情查询路径，不再读取旧 schema 的兼容查询路径。
+
+已有 schema `2/3` 快照不能直接提供查询服务，但仍可作为增量同步基线；下一次 incremental sync 会重建为 schema `4`。完成重建并发布新快照后，MCP 才会使用该 generation。

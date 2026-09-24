@@ -20,7 +20,7 @@ data-cs-2023/duckdb/current.json
 uv run arxiv-papers mcp --data-dir data-cs-2023
 ```
 
-每个 MCP 工具请求都会在查询锁内检查当前 generation。如果同步器已经发布新快照，MCP 会先只读打开新快照，打开成功后再替换旧连接；打开失败则继续使用旧连接。已经开始的查询不会读到半构建文件。
+每个 MCP 工具请求都会检查当前 generation，并从该 generation 的只读连接池取得短期租约。同步器已经发布新快照时，MCP 原子切换到新的 generation；旧 generation 会等待活跃租约释放后再关闭，因此已经开始的查询不会读到半构建文件，也不会使用已关闭的连接。
 
 显式传入 `--snapshot` 时，MCP 固定查询指定文件，不跟随 generation 切换。
 

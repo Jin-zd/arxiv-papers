@@ -80,7 +80,12 @@ class DuckDBQueryService:
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
-        self._paper_details_enabled = self._has_table("paper_details")
+        if not self._has_table("paper_details"):
+            self.connection.close()
+            raise QueryError(
+                "snapshot does not contain paper_details; "
+                "run an incremental or full sync to rebuild it"
+            )
 
     def __enter__(self) -> Self:
         return self
@@ -312,14 +317,12 @@ class DuckDBQueryService:
             raise QueryError("arxiv_id must not be empty")
         if version is not None and version < 1:
             raise QueryError("version must be positive")
-        if self._paper_details_enabled:
-            return self.get_papers((canonical_id,), version=version).get(canonical_id)
-        return self._get_paper_legacy(canonical_id, version=version)
+        return self.get_papers((canonical_id,), version=version).get(canonical_id)
 
     def get_papers(
         self, arxiv_ids: Sequence[str], *, version: int | None = None
     ) -> dict[str, dict[str, object] | None]:
-        """Return multiple current papers using one details query when available."""
+        """Return multiple current papers using one materialized details query."""
 
         if not arxiv_ids:
             raise QueryError("arxiv_ids must not be empty")
@@ -330,12 +333,6 @@ class DuckDBQueryService:
         canonical_ids = tuple(item.strip() for item in arxiv_ids)
         if any(not item for item in canonical_ids):
             raise QueryError("arxiv_ids must not contain empty values")
-
-        if not self._paper_details_enabled:
-            return {
-                arxiv_id: self._get_paper_legacy(arxiv_id, version=version)
-                for arxiv_id in dict.fromkeys(canonical_ids)
-            }
 
         placeholders = ", ".join("?" for _ in canonical_ids)
         select_columns = ", ".join(f"p.{column}" for column in _PAPER_COLUMNS)
@@ -382,31 +379,6 @@ class DuckDBQueryService:
         paper["versions"] = versions
         return paper
 
-    def _get_paper_legacy(
-        self, canonical_id: str, *, version: int | None
-    ) -> dict[str, object] | None:
-        row = self.connection.execute(
-            f"SELECT {', '.join(_PAPER_COLUMNS)} FROM papers "
-            "WHERE arxiv_id = ? LIMIT 1",
-            [canonical_id],
-        ).fetchone()
-        if row is None:
-            return None
-        paper = _row_to_dict(_PAPER_COLUMNS, row)
-        current_version = paper["version"]
-        if current_version is not None:
-            current_version = int(str(current_version))
-        selected_version = self._version(
-            canonical_id, current_version if version is None else version
-        )
-        if selected_version is None:
-            return None
-        paper["selected_version"] = selected_version
-        paper["authors"] = self._authors(canonical_id, current_version)
-        paper["categories"] = self._categories(canonical_id, current_version)
-        paper["versions"] = self._versions(canonical_id)
-        return paper
-
     def get_paper_by_doi(self, doi: str) -> dict[str, object] | None:
         """Return the current paper whose DOI matches exactly, case-insensitively."""
 
@@ -420,66 +392,6 @@ class DuckDBQueryService:
         if row is None:
             return None
         return self.get_paper(str(row[0]))
-
-    def _authors(self, arxiv_id: str, version: int | None) -> list[dict[str, object]]:
-        rows = self.connection.execute(
-            """
-            SELECT a.display_name, a.keyname, a.forenames, a.suffix,
-                   a.affiliations_json, pa.author_order
-            FROM paper_authors pa
-            JOIN authors a ON a.author_key = pa.author_key
-            WHERE pa.arxiv_id = ? AND pa.version IS NOT DISTINCT FROM ?
-            ORDER BY pa.author_order
-            """,
-            [arxiv_id, version],
-        ).fetchall()
-        columns = [item[0] for item in self.connection.description]
-        return [_row_to_dict(columns, row) for row in rows]
-
-    def _categories(
-        self, arxiv_id: str, version: int | None
-    ) -> list[dict[str, object]]:
-        rows = self.connection.execute(
-            """
-            SELECT category, is_primary
-            FROM categories
-            WHERE arxiv_id = ? AND version IS NOT DISTINCT FROM ?
-            ORDER BY is_primary DESC, category
-            """,
-            [arxiv_id, version],
-        ).fetchall()
-        columns = [item[0] for item in self.connection.description]
-        return [_row_to_dict(columns, row) for row in rows]
-
-    def _versions(self, arxiv_id: str) -> list[dict[str, object]]:
-        rows = self.connection.execute(
-            """
-            SELECT arxiv_id, version, first_submitted_at, submitted_at,
-                   size_kb, source_type, is_current, oai_datestamp
-            FROM paper_versions
-            WHERE arxiv_id = ?
-            ORDER BY version NULLS LAST
-            """,
-            [arxiv_id],
-        ).fetchall()
-        columns = [item[0] for item in self.connection.description]
-        return [_row_to_dict(columns, row) for row in rows]
-
-    def _version(self, arxiv_id: str, version: int | None) -> dict[str, object] | None:
-        row = self.connection.execute(
-            """
-            SELECT arxiv_id, version, first_submitted_at, submitted_at,
-                   size_kb, source_type, is_current, oai_datestamp
-            FROM paper_versions
-            WHERE arxiv_id = ? AND version IS NOT DISTINCT FROM ?
-            LIMIT 1
-            """,
-            [arxiv_id, version],
-        ).fetchone()
-        if row is None:
-            return None
-        columns = [item[0] for item in self.connection.description]
-        return _row_to_dict(columns, row)
 
     def _read_fts_enabled(self) -> bool:
         try:
