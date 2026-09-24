@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
 import math
 import threading
+from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import duckdb
 from mcp.server.mcpserver import MCPServer
@@ -25,10 +27,188 @@ from arxiv_papers.query import (
 from arxiv_papers.snapshots import SnapshotCatalog, SnapshotCatalogError
 
 LOGGER = logging.getLogger(__name__)
+_CACHE_MISS = object()
 
 
 class SnapshotResolutionError(RuntimeError):
     """Raised when no usable local query snapshot can be found."""
+
+
+class _SnapshotLease:
+    def __init__(self, handle: _SnapshotHandle, query: DuckDBQueryService) -> None:
+        self._handle = handle
+        self.query = query
+
+    @property
+    def generation(self) -> str:
+        return self._handle.generation
+
+    @property
+    def snapshot_path(self) -> Path:
+        return self._handle.snapshot_path
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self._handle.release(self.query)
+
+
+class _SnapshotHandle:
+    """Own a bounded pool of read-only connections for one immutable snapshot."""
+
+    def __init__(
+        self, snapshot_path: Path, generation: str, max_connections: int
+    ) -> None:
+        self.snapshot_path = snapshot_path
+        self.generation = generation
+        self.max_connections = max_connections
+        self._condition = threading.Condition()
+        self._available: list[DuckDBQueryService] = []
+        self._created = 0
+        self._active = 0
+        self._retiring = False
+
+    def acquire(self) -> _SnapshotLease:
+        create_connection = False
+        with self._condition:
+            while True:
+                if self._retiring:
+                    raise QueryError("snapshot generation is no longer active")
+                if self._available:
+                    query = self._available.pop()
+                    self._active += 1
+                    return _SnapshotLease(self, query)
+                if self._created < self.max_connections:
+                    self._created += 1
+                    self._active += 1
+                    create_connection = True
+                    break
+                self._condition.wait()
+
+        if create_connection:
+            try:
+                query = DuckDBQueryService(self.snapshot_path)
+            except Exception:
+                with self._condition:
+                    self._created -= 1
+                    self._active -= 1
+                    self._condition.notify()
+                raise
+            return _SnapshotLease(self, query)
+        raise AssertionError("snapshot connection acquisition did not complete")
+
+    def release(self, query: DuckDBQueryService) -> None:
+        close_query = False
+        with self._condition:
+            self._active -= 1
+            if self._retiring:
+                self._created -= 1
+                close_query = True
+            else:
+                self._available.append(query)
+            self._condition.notify()
+        if close_query:
+            query.close()
+
+    def retire(self) -> None:
+        available: list[DuckDBQueryService]
+        with self._condition:
+            if self._retiring:
+                return
+            self._retiring = True
+            available = self._available
+            self._available = []
+            self._created -= len(available)
+            self._condition.notify_all()
+        for query in available:
+            query.close()
+
+
+class _SnapshotManager:
+    """Publish immutable snapshot handles without holding a query-wide lock."""
+
+    def __init__(
+        self,
+        snapshot_path: Path,
+        catalog: SnapshotCatalog | None,
+        *,
+        max_connections: int,
+    ) -> None:
+        if max_connections < 1:
+            raise ValueError("max_connections must be positive")
+        self.catalog = catalog
+        self.max_connections = max_connections
+        self._lock = threading.Lock()
+        self._closed = False
+        self._current = _SnapshotHandle(
+            snapshot_path,
+            self._initial_generation(snapshot_path, catalog),
+            max_connections,
+        )
+
+    @staticmethod
+    def _initial_generation(
+        snapshot_path: Path, catalog: SnapshotCatalog | None
+    ) -> str:
+        if catalog is not None:
+            try:
+                pointer = catalog.read_current()
+            except SnapshotCatalogError:
+                pointer = None
+            if (
+                pointer is not None
+                and pointer.snapshot_path.is_file()
+                and _same_path(pointer.snapshot_path, snapshot_path)
+            ):
+                return pointer.generation
+        return str(snapshot_path.resolve())
+
+    def acquire(self) -> _SnapshotLease:
+        self._refresh()
+        while True:
+            with self._lock:
+                if self._closed:
+                    raise QueryError("MCP snapshot manager is closed")
+                current = self._current
+            try:
+                return current.acquire()
+            except QueryError:
+                # A refresh may retire the handle after it was observed.
+                continue
+
+    def _refresh(self) -> None:
+        if self.catalog is None:
+            return
+        try:
+            pointer = self.catalog.read_current()
+        except SnapshotCatalogError as error:
+            LOGGER.warning("ignoring invalid current snapshot pointer: %s", error)
+            return
+        if pointer is None or not pointer.snapshot_path.is_file():
+            return
+
+        with self._lock:
+            current = self._current
+            if (
+                _same_path(pointer.snapshot_path, current.snapshot_path)
+                and pointer.generation == current.generation
+            ):
+                return
+            self._current = _SnapshotHandle(
+                pointer.snapshot_path,
+                pointer.generation,
+                self.max_connections,
+            )
+        current.retire()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            current = self._current
+        current.retire()
 
 
 class LocalArxivMCPServer:
@@ -39,23 +219,24 @@ class LocalArxivMCPServer:
         snapshot_path: Path | str,
         *,
         catalog: SnapshotCatalog | None = None,
+        max_connections: int = 8,
+        cache_size: int = 2048,
     ) -> None:
-        self.snapshot_path = Path(snapshot_path)
+        if cache_size < 0:
+            raise ValueError("cache_size must be non-negative")
+        initial_path = Path(snapshot_path)
         self.catalog = catalog
-        self._generation: str | None = None
-        if catalog is not None:
-            try:
-                pointer = catalog.read_current()
-            except SnapshotCatalogError:
-                pointer = None
-            if (
-                pointer is not None
-                and pointer.snapshot_path.is_file()
-                and _same_path(pointer.snapshot_path, self.snapshot_path)
-            ):
-                self._generation = pointer.generation
-        self.query = DuckDBQueryService(self.snapshot_path)
-        self._query_lock = threading.Lock()
+        self._snapshots = _SnapshotManager(
+            initial_path,
+            catalog,
+            max_connections=max_connections,
+        )
+        self._cache_size = cache_size
+        self._cache_lock = threading.Lock()
+        self._paper_cache: OrderedDict[
+            tuple[str, str, int | None], dict[str, object] | None
+        ] = OrderedDict()
+        self._inflight: dict[tuple[str, str, int | None], threading.Lock] = {}
         self.server = MCPServer(
             name="arxiv-papers",
             version="0.1.0",
@@ -82,6 +263,14 @@ class LocalArxivMCPServer:
             structured_output=True,
         )
         self.server.add_tool(
+            self.get_papers,
+            description=(
+                "Get up to 100 local arXiv papers in one batch, including current "
+                "metadata, authors, categories, and available version facts."
+            ),
+            structured_output=True,
+        )
+        self.server.add_tool(
             self.search_by_author,
             description="Search current local arXiv papers by author name with cursor pagination.",
             structured_output=True,
@@ -98,48 +287,19 @@ class LocalArxivMCPServer:
         )
 
     def close(self) -> None:
-        with self._query_lock:
-            self.query.close()
+        self._snapshots.close()
 
-    def _refresh_snapshot_locked(self) -> None:
-        if self.catalog is None:
-            return
-        try:
-            pointer = self.catalog.read_current()
-        except SnapshotCatalogError as error:
-            LOGGER.warning("ignoring invalid current snapshot pointer: %s", error)
-            return
-        if pointer is None or not pointer.snapshot_path.is_file():
-            return
-        current = pointer.snapshot_path
-        if (
-            _same_path(current, self.snapshot_path)
-            and pointer.generation == self._generation
-        ):
-            return
-        try:
-            replacement = DuckDBQueryService(current)
-        except QueryError as error:
-            LOGGER.warning("keeping previous snapshot after failed reload: %s", error)
-            return
-        previous = self.query
-        self.query = replacement
-        self.snapshot_path = current
-        self._generation = pointer.generation
-        previous.close()
-
-    def _cursor_fingerprint(self, filters: Mapping[str, object]) -> str:
+    def _cursor_fingerprint(
+        self, filters: Mapping[str, object], *, snapshot_identity: str
+    ) -> str:
         payload = {
             **filters,
-            "snapshot": self._snapshot_identity(),
+            "snapshot": snapshot_identity,
         }
         encoded = json.dumps(
             payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-    def _snapshot_identity(self) -> str:
-        return self._generation or str(self.snapshot_path.resolve())
 
     def search_papers(
         self,
@@ -156,8 +316,7 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers using keyword and structured filters."""
 
-        with self._query_lock:
-            self._refresh_snapshot_locked()
+        with self._snapshots.acquire() as lease:
             fingerprint = self._cursor_fingerprint(
                 {
                     "query": query,
@@ -168,10 +327,11 @@ class LocalArxivMCPServer:
                     "created_until": created_until,
                     "updated_from": updated_from,
                     "updated_until": updated_until,
-                }
+                },
+                snapshot_identity=lease.generation,
             )
             after = _decode_cursor(cursor, fingerprint)
-            page = self.query.search_papers(
+            page = lease.query.search_papers(
                 query=query,
                 author=author,
                 category=category,
@@ -188,10 +348,67 @@ class LocalArxivMCPServer:
     def get_paper(self, arxiv_id: str, version: int | None = None) -> dict[str, Any]:
         """Get one current local paper and its available version facts."""
 
-        with self._query_lock:
-            self._refresh_snapshot_locked()
-            paper = self.query.get_paper(arxiv_id, version=version)
-        return {"paper": _jsonable(paper)}
+        canonical_id = arxiv_id.strip()
+        with self._snapshots.acquire() as lease:
+            key = (lease.generation, canonical_id, version)
+            cached = self._cache_get(key)
+            if cached is not _CACHE_MISS:
+                return {"paper": cached}
+
+            key_lock = self._get_inflight_lock(key)
+            try:
+                with key_lock:
+                    cached = self._cache_get(key)
+                    if cached is not _CACHE_MISS:
+                        return {"paper": cached}
+                    paper = _jsonable(
+                        lease.query.get_paper(canonical_id, version=version)
+                    )
+                    self._cache_put(key, paper)
+                    return {"paper": copy.deepcopy(paper)}
+            finally:
+                with self._cache_lock:
+                    if self._inflight.get(key) is key_lock:
+                        self._inflight.pop(key, None)
+
+    def get_papers(
+        self, arxiv_ids: list[str], version: int | None = None
+    ) -> dict[str, Any]:
+        """Get up to 100 current local papers in one batch."""
+
+        if not arxiv_ids:
+            raise QueryError("arxiv_ids must not be empty")
+        if len(arxiv_ids) > 100:
+            raise QueryError("at most 100 arxiv_ids may be requested")
+        canonical_ids = tuple(item.strip() for item in arxiv_ids)
+        if any(not item for item in canonical_ids):
+            raise QueryError("arxiv_ids must not contain empty values")
+
+        with self._snapshots.acquire() as lease:
+            unique_ids = tuple(dict.fromkeys(canonical_ids))
+            papers: dict[str, object] = {}
+            missing: list[str] = []
+            for arxiv_id in unique_ids:
+                key = (lease.generation, arxiv_id, version)
+                cached = self._cache_get(key)
+                if cached is _CACHE_MISS:
+                    missing.append(arxiv_id)
+                else:
+                    papers[arxiv_id] = cached
+
+            if missing:
+                loaded = lease.query.get_papers(missing, version=version)
+                for arxiv_id in missing:
+                    paper = _jsonable(loaded.get(arxiv_id))
+                    papers[arxiv_id] = paper
+                    self._cache_put((lease.generation, arxiv_id, version), paper)
+
+            return {
+                "papers": [
+                    {"arxiv_id": arxiv_id, "paper": copy.deepcopy(papers[arxiv_id])}
+                    for arxiv_id in canonical_ids
+                ]
+            }
 
     def search_by_author(
         self,
@@ -201,11 +418,12 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers by normalized author display name."""
 
-        with self._query_lock:
-            self._refresh_snapshot_locked()
-            fingerprint = self._cursor_fingerprint({"author": author})
+        with self._snapshots.acquire() as lease:
+            fingerprint = self._cursor_fingerprint(
+                {"author": author}, snapshot_identity=lease.generation
+            )
             after = _decode_cursor(cursor, fingerprint)
-            page = self.query.search_by_author(author, limit=limit, after=after)
+            page = lease.query.search_by_author(author, limit=limit, after=after)
         return _page_payload(page, fingerprint)
 
     def search_by_category(
@@ -217,13 +435,13 @@ class LocalArxivMCPServer:
     ) -> dict[str, Any]:
         """Search local current papers by exact category or category prefix."""
 
-        with self._query_lock:
-            self._refresh_snapshot_locked()
+        with self._snapshots.acquire() as lease:
             fingerprint = self._cursor_fingerprint(
-                {"category": category, "primary_only": primary_only}
+                {"category": category, "primary_only": primary_only},
+                snapshot_identity=lease.generation,
             )
             after = _decode_cursor(cursor, fingerprint)
-            page = self.query.search_by_category(
+            page = lease.query.search_by_category(
                 category,
                 primary_only=primary_only,
                 limit=limit,
@@ -234,11 +452,10 @@ class LocalArxivMCPServer:
     def library_status(self) -> dict[str, Any]:
         """Return local snapshot metadata without contacting the network."""
 
-        with self._query_lock:
-            self._refresh_snapshot_locked()
-            query = self.query
-            snapshot_path = self.snapshot_path
-            generation = self._generation
+        with self._snapshots.acquire() as lease:
+            query = lease.query
+            snapshot_path = lease.snapshot_path
+            generation = lease.generation
             rows = query.connection.execute(
                 "SELECT key, value FROM library_metadata"
             ).fetchall()
@@ -260,6 +477,33 @@ class LocalArxivMCPServer:
             "fts_enabled": fts_enabled,
             "generation": generation,
         }
+
+    def _cache_get(
+        self, key: tuple[str, str, int | None]
+    ) -> dict[str, object] | None | object:
+        if self._cache_size == 0:
+            return _CACHE_MISS
+        with self._cache_lock:
+            if key not in self._paper_cache:
+                return _CACHE_MISS
+            value = self._paper_cache.pop(key)
+            self._paper_cache[key] = value
+            return copy.deepcopy(value)
+
+    def _cache_put(
+        self, key: tuple[str, str, int | None], value: dict[str, object] | None
+    ) -> None:
+        if self._cache_size == 0:
+            return
+        with self._cache_lock:
+            self._paper_cache[key] = copy.deepcopy(value)
+            self._paper_cache.move_to_end(key)
+            while len(self._paper_cache) > self._cache_size:
+                self._paper_cache.popitem(last=False)
+
+    def _get_inflight_lock(self, key: tuple[str, str, int | None]) -> threading.Lock:
+        with self._cache_lock:
+            return self._inflight.setdefault(key, threading.Lock())
 
 
 def resolve_snapshot_path(

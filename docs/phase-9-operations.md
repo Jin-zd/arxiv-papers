@@ -102,21 +102,6 @@ uv run arxiv-papers ops compact \
 compact 输出到新目录，不覆盖源数据，也不会自动替换当前 DuckDB 快照。替换快照前
 应重新构建并通过现有 snapshot 校验流程。
 
-## 查询 benchmark
-
-可以对当前本地快照运行只读 benchmark：
-
-```bash
-uv run arxiv-papers ops benchmark \
-  --data-dir data-cs-2023 \
-  --iterations 5 \
-  --limit 20
-```
-
-benchmark 自动从快照中选择代表性的关键词、作者、分类和 arXiv ID，输出每类查询的
-最小、median、p95 延迟，以及结果数和是否存在下一页。它不访问网络、不修改快照，也
-不设置依赖机器性能的硬阈值。
-
 ## 性能边界
 
 第一版继续使用 DuckDB 的结构化索引布局和全文搜索表，查询只读本地快照。阶段 9

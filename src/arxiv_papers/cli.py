@@ -7,7 +7,6 @@ from pathlib import Path
 
 import typer
 
-from arxiv_papers.benchmark import BenchmarkError, benchmark_snapshot
 from arxiv_papers.logging_config import configure_logging
 from arxiv_papers.maintenance import (
     MaintenanceError,
@@ -19,7 +18,6 @@ from arxiv_papers.maintenance import (
 )
 from arxiv_papers.oai import OAIClient, OAIClientConfig
 from arxiv_papers.progress import ProgressDisplay
-from arxiv_papers.snapshots import SnapshotCatalog, SnapshotCatalogError
 from arxiv_papers.state import SyncStateStore
 from arxiv_papers.sync import FullSyncRunner, IncrementalSyncRunner
 
@@ -229,40 +227,6 @@ def ops_schedule(
     except MaintenanceError as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(_json_output(plan))
-
-
-@ops_app.command("benchmark")
-def ops_benchmark(
-    data_dir: Path = typer.Option(  # noqa: B008
-        DEFAULT_DATA_DIR, help="Local data directory."
-    ),
-    snapshot: Path | None = typer.Option(  # noqa: B008
-        None, "--snapshot", help="Explicit DuckDB snapshot path."
-    ),
-    iterations: int = typer.Option(5, min=1, help="Runs per benchmark case."),
-    limit: int = typer.Option(20, min=1, max=100, help="Page size."),
-) -> None:
-    """Benchmark representative read-only local query shapes as JSON."""
-
-    from arxiv_papers.mcp_server import SnapshotResolutionError, resolve_snapshot_path
-
-    try:
-        snapshot_path = resolve_snapshot_path(data_dir, snapshot=snapshot)
-        report = benchmark_snapshot(snapshot_path, iterations=iterations, limit=limit)
-        try:
-            pointer = SnapshotCatalog(data_dir / "duckdb").read_current()
-        except SnapshotCatalogError:
-            pointer = None
-        if (
-            pointer is not None
-            and pointer.snapshot_path.resolve() == snapshot_path.resolve()
-        ):
-            report["generation"] = pointer.generation
-        else:
-            report["generation"] = None
-    except (BenchmarkError, SnapshotResolutionError) as error:
-        raise typer.BadParameter(str(error)) from error
-    typer.echo(_json_output(report))
 
 
 @sync_app.command("incremental")

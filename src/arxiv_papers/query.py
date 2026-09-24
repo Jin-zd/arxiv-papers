@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -38,6 +39,30 @@ class SearchPage:
     next_position: SearchPosition | None = None
 
 
+_PAPER_COLUMNS = (
+    "arxiv_id",
+    "version",
+    "title",
+    "abstract",
+    "created",
+    "updated",
+    "first_submitted_at",
+    "submitted_at",
+    "size_kb",
+    "source_type",
+    "is_current",
+    "comments",
+    "journal_ref",
+    "doi",
+    "license",
+    "primary_category",
+    "authors_raw",
+    "oai_identifier",
+    "oai_datestamp",
+    "metadata_hash",
+)
+
+
 class DuckDBQueryService:
     """Query one immutable snapshot without opening any network connection."""
 
@@ -55,6 +80,7 @@ class DuckDBQueryService:
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
+        self._paper_details_enabled = self._has_table("paper_details")
 
     def __enter__(self) -> Self:
         return self
@@ -284,19 +310,92 @@ class DuckDBQueryService:
         canonical_id = arxiv_id.strip()
         if not canonical_id:
             raise QueryError("arxiv_id must not be empty")
-        parameters: list[object] = [canonical_id]
         if version is not None and version < 1:
             raise QueryError("version must be positive")
+        if self._paper_details_enabled:
+            return self.get_papers((canonical_id,), version=version).get(canonical_id)
+        return self._get_paper_legacy(canonical_id, version=version)
+
+    def get_papers(
+        self, arxiv_ids: Sequence[str], *, version: int | None = None
+    ) -> dict[str, dict[str, object] | None]:
+        """Return multiple current papers using one details query when available."""
+
+        if not arxiv_ids:
+            raise QueryError("arxiv_ids must not be empty")
+        if len(arxiv_ids) > 100:
+            raise QueryError("at most 100 arxiv_ids may be requested")
+        if version is not None and version < 1:
+            raise QueryError("version must be positive")
+        canonical_ids = tuple(item.strip() for item in arxiv_ids)
+        if any(not item for item in canonical_ids):
+            raise QueryError("arxiv_ids must not contain empty values")
+
+        if not self._paper_details_enabled:
+            return {
+                arxiv_id: self._get_paper_legacy(arxiv_id, version=version)
+                for arxiv_id in dict.fromkeys(canonical_ids)
+            }
+
+        placeholders = ", ".join("?" for _ in canonical_ids)
+        select_columns = ", ".join(f"p.{column}" for column in _PAPER_COLUMNS)
+        rows = self.connection.execute(
+            f"""
+            SELECT {select_columns}, d.authors_json, d.categories_json,
+                   d.versions_json
+            FROM papers p
+            LEFT JOIN paper_details d ON d.arxiv_id = p.arxiv_id
+            WHERE p.arxiv_id IN ({placeholders})
+            """,
+            list(dict.fromkeys(canonical_ids)),
+        ).fetchall()
+        papers = {
+            str(row[0]): self._paper_from_details_row(row, version=version)
+            for row in rows
+        }
+        return {arxiv_id: papers.get(arxiv_id) for arxiv_id in dict.fromkeys(canonical_ids)}
+
+    def _paper_from_details_row(
+        self, row: Sequence[object], *, version: int | None
+    ) -> dict[str, object] | None:
+        paper = _row_to_dict(_PAPER_COLUMNS, row[: len(_PAPER_COLUMNS)])
+        authors = _json_list(row[len(_PAPER_COLUMNS)])
+        categories = _json_list(row[len(_PAPER_COLUMNS) + 1])
+        versions = _version_list(row[len(_PAPER_COLUMNS) + 2])
+        current_version = paper["version"]
+        if current_version is not None:
+            current_version = int(str(current_version))
+        selected_version = next(
+            (
+                item
+                for item in versions
+                if item.get("version")
+                == (current_version if version is None else version)
+            ),
+            None,
+        )
+        if selected_version is None:
+            return None
+        paper["selected_version"] = selected_version
+        paper["authors"] = authors
+        paper["categories"] = categories
+        paper["versions"] = versions
+        return paper
+
+    def _get_paper_legacy(
+        self, canonical_id: str, *, version: int | None
+    ) -> dict[str, object] | None:
         row = self.connection.execute(
-            "SELECT * FROM papers WHERE arxiv_id = ? LIMIT 1", parameters
+            f"SELECT {', '.join(_PAPER_COLUMNS)} FROM papers "
+            "WHERE arxiv_id = ? LIMIT 1",
+            [canonical_id],
         ).fetchone()
         if row is None:
             return None
-        columns = [item[0] for item in self.connection.description]
-        paper = _row_to_dict(columns, row)
+        paper = _row_to_dict(_PAPER_COLUMNS, row)
         current_version = paper["version"]
         if current_version is not None:
-            current_version = int(current_version)
+            current_version = int(str(current_version))
         selected_version = self._version(
             canonical_id, current_version if version is None else version
         )
@@ -399,6 +498,14 @@ class DuckDBQueryService:
         ).fetchone()
         return bool(row and row[0])
 
+    def _has_table(self, table: str) -> bool:
+        row = self.connection.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name = ?",
+            [table],
+        ).fetchone()
+        return bool(row and row[0])
+
     def _author_name_expression(self) -> str:
         if self._authors_have_normalized_name:
             return "a.display_name_normalized"
@@ -426,6 +533,33 @@ def _date_value(value: date | str) -> date:
 
 def _row_to_dict(columns: Sequence[str], row: Sequence[object]) -> dict[str, object]:
     return {column: value for column, value in zip(columns, row, strict=True)}
+
+
+def _json_list(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise QueryError("snapshot contains invalid paper detail JSON") from error
+    if not isinstance(parsed, list) or any(not isinstance(item, dict) for item in parsed):
+        raise QueryError("snapshot contains invalid paper detail JSON")
+    return [dict(item) for item in parsed]
+
+
+def _version_list(value: object) -> list[dict[str, object]]:
+    versions = _json_list(value)
+    for version in versions:
+        for field in ("first_submitted_at", "submitted_at"):
+            timestamp = version.get(field)
+            if isinstance(timestamp, str):
+                try:
+                    version[field] = datetime.fromisoformat(timestamp)
+                except ValueError as error:
+                    raise QueryError(
+                        "snapshot contains invalid version timestamp"
+                    ) from error
+    return versions
 
 
 __all__ = [

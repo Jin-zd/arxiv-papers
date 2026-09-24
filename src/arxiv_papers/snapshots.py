@@ -30,7 +30,7 @@ _BASE_SNAPSHOT_TABLES = (
     "library_metadata",
 )
 _SEARCH_SNAPSHOT_TABLES = ("paper_search", "search_metadata")
-_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"2", "3"})
+_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"2", "3", "4"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +202,7 @@ class SnapshotCatalog:
                     raise SnapshotCatalogError(
                         f"snapshot uses unsupported schema version: {schema_version}"
                     )
-                if schema_version == "3":
+                if schema_version in {"3", "4"}:
                     missing_search = [
                         table
                         for table in _SEARCH_SNAPSHOT_TABLES
@@ -213,6 +213,15 @@ class SnapshotCatalog:
                             f"snapshot is missing required table: {missing_search[0]}"
                         )
                     connection.execute("SELECT count(*) FROM current_papers").fetchone()
+                if schema_version == "4":
+                    paper_details = connection.execute(
+                        "SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema = 'main' AND table_name = 'paper_details'"
+                    ).fetchone()
+                    if paper_details is None or int(paper_details[0]) != 1:
+                        raise SnapshotCatalogError(
+                            "snapshot is missing required table: paper_details"
+                        )
         except duckdb.Error as error:
             raise SnapshotCatalogError(
                 f"snapshot failed read-only validation: {snapshot_path}"

@@ -89,7 +89,7 @@ TABLE_SCHEMAS = {
     "categories": CATEGORY_SCHEMA,
     "deleted_records": DELETED_SCHEMA,
 }
-SNAPSHOT_SCHEMA_VERSION = "3"
+SNAPSHOT_SCHEMA_VERSION = "4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +255,7 @@ class DuckDBSnapshotBuilder:
         try:
             connection = duckdb.connect(str(temporary_path))
             self._build_tables(connection, parquet_root, base_snapshot)
+            self._build_paper_details(connection)
             self._build_search_indexes(connection)
             self._run_query_smoke_test(connection)
             connection.execute("CHECKPOINT")
@@ -293,7 +294,7 @@ class DuckDBSnapshotBuilder:
                 "base snapshot is not compatible with the version-history schema; "
                 "run a new full sync in a new data directory"
             ) from error
-        if row is None or str(row[0]) not in {"2", SNAPSHOT_SCHEMA_VERSION}:
+        if row is None or str(row[0]) not in {"2", "3", SNAPSHOT_SCHEMA_VERSION}:
             raise RuntimeError(
                 "base snapshot uses an older schema without arXivRaw version history; "
                 "run a new full sync in a new data directory"
@@ -524,6 +525,86 @@ class DuckDBSnapshotBuilder:
             ) AS metadata(key, value)
             """,
             ["true" if fts_enabled else "false"],
+        )
+
+    @staticmethod
+    def _build_paper_details(connection: duckdb.DuckDBPyConnection) -> None:
+        """Materialize current-paper relationships for single-row lookups."""
+
+        connection.execute(
+            """
+            CREATE TABLE paper_details AS
+            WITH current_authors AS (
+                SELECT
+                    pa.arxiv_id,
+                    pa.version,
+                    to_json(list(
+                        struct_pack(
+                            display_name := a.display_name,
+                            keyname := a.keyname,
+                            forenames := a.forenames,
+                            suffix := a.suffix,
+                            affiliations_json := a.affiliations_json,
+                            author_order := pa.author_order
+                        ) ORDER BY pa.author_order
+                    )) AS authors_json
+                FROM paper_authors pa
+                JOIN authors a ON a.author_key = pa.author_key
+                GROUP BY pa.arxiv_id, pa.version
+            ), current_categories AS (
+                SELECT
+                    arxiv_id,
+                    version,
+                    to_json(list(
+                        struct_pack(
+                            category := category,
+                            is_primary := is_primary
+                        ) ORDER BY is_primary DESC, category
+                    )) AS categories_json
+                FROM categories
+                GROUP BY arxiv_id, version
+            ), version_history AS (
+                SELECT
+                    arxiv_id,
+                    to_json(list(
+                        struct_pack(
+                            arxiv_id := arxiv_id,
+                            version := version,
+                            first_submitted_at := CASE
+                                WHEN first_submitted_at IS NULL THEN NULL
+                                ELSE strftime(first_submitted_at, '%Y-%m-%dT%H:%M:%S.%f')
+                            END,
+                            submitted_at := CASE
+                                WHEN submitted_at IS NULL THEN NULL
+                                ELSE strftime(submitted_at, '%Y-%m-%dT%H:%M:%S.%f')
+                            END,
+                            size_kb := size_kb,
+                            source_type := source_type,
+                            is_current := is_current,
+                            oai_datestamp := oai_datestamp
+                        ) ORDER BY version NULLS LAST
+                    )) AS versions_json
+                FROM paper_versions
+                GROUP BY arxiv_id
+            )
+            SELECT
+                p.arxiv_id,
+                coalesce(ca.authors_json, '[]') AS authors_json,
+                coalesce(cc.categories_json, '[]') AS categories_json,
+                coalesce(vh.versions_json, '[]') AS versions_json
+            FROM papers p
+            LEFT JOIN current_authors ca
+                ON ca.arxiv_id = p.arxiv_id
+                AND ca.version IS NOT DISTINCT FROM p.version
+            LEFT JOIN current_categories cc
+                ON cc.arxiv_id = p.arxiv_id
+                AND cc.version IS NOT DISTINCT FROM p.version
+            LEFT JOIN version_history vh ON vh.arxiv_id = p.arxiv_id
+            """
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_paper_details_arxiv_id "
+            "ON paper_details (arxiv_id)"
         )
 
     @staticmethod

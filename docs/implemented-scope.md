@@ -68,7 +68,6 @@ uv run arxiv-papers ops backup --data-dir data-cs-2023 --output-dir backups
 uv run arxiv-papers ops compact \
   --source data-cs-2023/parquet/full/<run-id>
 uv run arxiv-papers ops schedule --data-dir data-cs-2023 --hour 2 --minute 0
-uv run arxiv-papers ops benchmark --data-dir data-cs-2023 --iterations 5 --limit 20
 ```
 
 同步支持 `--log-file` 输出 JSONL 结构化日志；同步结果中的 `stats` 包含请求、重试、
