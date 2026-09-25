@@ -11,6 +11,8 @@ from typing import Self
 
 import duckdb
 
+from arxiv_papers.runtime import DEFAULT_RUNTIME, DuckDBRuntimeConfig
+
 
 class QueryError(Exception):
     """Base class for local snapshot query errors."""
@@ -68,15 +70,34 @@ class DuckDBQueryService:
 
     MAX_LIMIT = 100
 
-    def __init__(self, snapshot_path: Path | str) -> None:
+    def __init__(
+        self,
+        snapshot_path: Path | str,
+        *,
+        runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME,
+    ) -> None:
         self.snapshot_path = Path(snapshot_path)
         if not self.snapshot_path.exists():
             raise SnapshotNotFoundError(f"snapshot does not exist: {snapshot_path}")
         try:
             self.connection = duckdb.connect(str(self.snapshot_path), read_only=True)
+            runtime.configure(self.connection, role="query")
         except duckdb.Error as error:
             raise QueryError(f"failed to open snapshot: {snapshot_path}") from error
         self.fts_enabled = self._read_fts_enabled()
+        if self.fts_enabled:
+            try:
+                self.connection.execute("LOAD fts")
+            except duckdb.Error:
+                try:
+                    self.connection.execute("INSTALL fts")
+                    self.connection.execute("LOAD fts")
+                except duckdb.Error as error:
+                    self.connection.close()
+                    raise QueryError(
+                        "snapshot requires the DuckDB FTS extension; "
+                        "install the matching extension"
+                    ) from error
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
@@ -124,12 +145,10 @@ class DuckDBQueryService:
                 parameters.append(normalized_query)
                 conditions.append("search_score.relevance IS NOT NULL")
             else:
-                pattern = f"%{normalized_query}%"
-                conditions.append(
-                    "(p.title ILIKE ? OR p.abstract ILIKE ? OR "
-                    "p.comments ILIKE ? OR p.journal_ref ILIKE ?)"
+                raise QueryError(
+                    "full-text search is unavailable in this snapshot; "
+                    "rebuild it with the DuckDB FTS extension"
                 )
-                parameters.extend([pattern] * 4)
 
         if author:
             conditions.append(
@@ -183,13 +202,24 @@ class DuckDBQueryService:
             "AND c.version IS NOT DISTINCT FROM w.version), [])"
         )
         from_sql = "papers p"
+        search_cte = ""
         if normalized_query and self.fts_enabled:
+            search_cte = """
+                search_candidates AS (
+                    SELECT arxiv_id, relevance
+                    FROM (
+                        SELECT arxiv_id,
+                               fts_main_paper_search.match_bm25(
+                                   arxiv_id, ?
+                               ) AS relevance
+                        FROM paper_search
+                    ) candidates
+                    WHERE relevance IS NOT NULL
+                ),
+            """
             from_sql = (
-                "papers p JOIN ("
-                "SELECT arxiv_id, "
-                "fts_main_paper_search.match_bm25(arxiv_id, ?) AS relevance "
-                "FROM paper_search"
-                ") search_score ON search_score.arxiv_id = p.arxiv_id"
+                "papers p JOIN search_candidates search_score "
+                "ON search_score.arxiv_id = p.arxiv_id"
             )
         position_condition = "1 = 1"
         position_parameters: list[object] = []
@@ -228,7 +258,7 @@ class DuckDBQueryService:
             )
 
         sql = f"""
-            WITH ranked AS (
+            WITH {search_cte} ranked AS (
                 SELECT p.arxiv_id, p.version, p.title, p.abstract, p.created,
                        p.updated, p.doi, p.journal_ref, p.comments,
                        p.primary_category, {score_sql} AS relevance,

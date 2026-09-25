@@ -6,8 +6,11 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Self
 
 import duckdb
+
+from arxiv_papers.runtime import DEFAULT_RUNTIME, DuckDBRuntimeConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +62,13 @@ class SyncContext:
 class SyncStateStore:
     """Store checkpoints separately from the query snapshot database."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(
+        self, path: Path | str, *, runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with duckdb.connect(str(self.path)) as connection:
+            runtime.configure(connection, role="query")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sync_state (
@@ -89,6 +95,7 @@ class SyncStateStore:
                 )
                 """
             )
+
             for column, definition in (
                 ("metadata_prefix", "VARCHAR"),
                 ("created_from", "VARCHAR"),
@@ -138,6 +145,17 @@ class SyncStateStore:
                 CREATE SEQUENCE IF NOT EXISTS dead_letter_id_seq START 1
                 """
             )
+
+    def checkpoint_session(
+        self,
+        *,
+        run_id: str,
+        sync_name: str = "full",
+        runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME,
+    ) -> SyncCheckpointSession:
+        return SyncCheckpointSession(
+            self, run_id=run_id, sync_name=sync_name, runtime=runtime
+        )
 
     def begin_full(
         self,
@@ -578,6 +596,157 @@ def overlap_datestamp(
     return max(original_from[:10], recovery_value)
 
 
+class SyncCheckpointSession:
+    """Reuse one state connection and commit completed pages in batches."""
+
+    def __init__(
+        self,
+        store: SyncStateStore,
+        *,
+        run_id: str,
+        sync_name: str,
+        runtime: DuckDBRuntimeConfig,
+    ) -> None:
+        self.store = store
+        self.run_id = run_id
+        self.sync_name = sync_name
+        self.connection = duckdb.connect(str(store.path))
+        runtime.configure(self.connection, role="query")
+        self._closed = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def begin_page(
+        self, *, page_number: int, request_params: dict[str, str]
+    ) -> None:
+        now = _now()
+        self.connection.execute(
+            """
+            INSERT INTO sync_batches (
+                run_id, page_number, status, request_params_json,
+                response_sha256, records, parsed_records, parse_errors,
+                warnings, max_datestamp, next_resumption_token,
+                started_at, completed_at, error
+            ) VALUES (?, ?, 'started', ?, NULL, 0, 0, 0, 0, NULL,
+                      NULL, ?, NULL, NULL)
+            ON CONFLICT (run_id, page_number) DO UPDATE SET
+                status = 'started', request_params_json = excluded.request_params_json,
+                response_sha256 = NULL, records = 0, parsed_records = 0,
+                parse_errors = 0, warnings = 0, max_datestamp = NULL,
+                next_resumption_token = NULL, started_at = excluded.started_at,
+                completed_at = NULL, error = NULL
+            """,
+            [self.run_id, page_number, json.dumps(request_params, sort_keys=True), now],
+        )
+
+    def complete_pages(self, pages: list[dict[str, object]]) -> None:
+        if not pages:
+            return
+        now = _now()
+        last = pages[-1]
+        max_datestamp = max(
+            (str(page["max_datestamp"]) for page in pages if page["max_datestamp"]),
+            default=None,
+        )
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            for page in pages:
+                self.connection.execute(
+                    """
+                    UPDATE sync_batches
+                    SET status = 'completed', response_sha256 = ?, records = ?,
+                        parsed_records = ?, parse_errors = ?, warnings = ?,
+                        max_datestamp = ?, next_resumption_token = ?,
+                        completed_at = ?, error = NULL
+                    WHERE run_id = ? AND page_number = ?
+                    """,
+                    [
+                        page["response_sha256"],
+                        page["records"],
+                        page["parsed_records"],
+                        page["parse_errors"],
+                        page["warnings"],
+                        page["max_datestamp"],
+                        page["next_resumption_token"],
+                        now,
+                        self.run_id,
+                        page["page_number"],
+                    ],
+                )
+            self.connection.execute(
+                """
+                UPDATE sync_state
+                SET updated_at = ?, next_resumption_token = ?,
+                    last_successful_page = ?,
+                    last_successful_datestamp = CASE
+                        WHEN last_successful_datestamp IS NULL THEN ?
+                        WHEN ? IS NULL THEN last_successful_datestamp
+                        WHEN ? > last_successful_datestamp THEN ?
+                        ELSE last_successful_datestamp
+                    END,
+                    error = NULL
+                WHERE sync_name = ? AND run_id = ?
+                """,
+                [
+                    now,
+                    last["next_resumption_token"],
+                    last["page_number"],
+                    max_datestamp,
+                    max_datestamp,
+                    max_datestamp,
+                    max_datestamp,
+                    self.sync_name,
+                    self.run_id,
+                ],
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_dead_letter(
+        self,
+        *,
+        page_number: int,
+        oai_identifier: str,
+        error_type: str,
+        error: str,
+        raw_xml_path: Path | None = None,
+    ) -> None:
+        sequence_row = self.connection.execute(
+            "SELECT nextval('dead_letter_id_seq')"
+        ).fetchone()
+        if sequence_row is None:
+            raise RuntimeError("dead-letter sequence returned no value")
+        self.connection.execute(
+            """
+            INSERT INTO dead_letters (
+                id, run_id, page_number, oai_identifier, error_type,
+                error, raw_xml_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                int(sequence_row[0]),
+                self.run_id,
+                page_number,
+                oai_identifier,
+                error_type,
+                error[:4000],
+                str(raw_xml_path) if raw_xml_path else None,
+                _now(),
+            ],
+        )
+
+    def close(self) -> None:
+        if not self._closed:
+            self.connection.close()
+            self._closed = True
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -721,4 +890,10 @@ _STATE_COLUMNS = (
 )
 
 
-__all__ = ["SyncContext", "SyncState", "SyncStateStore", "overlap_datestamp"]
+__all__ = [
+    "SyncCheckpointSession",
+    "SyncContext",
+    "SyncState",
+    "SyncStateStore",
+    "overlap_datestamp",
+]

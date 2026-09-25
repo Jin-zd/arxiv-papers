@@ -9,8 +9,10 @@ import json
 import logging
 import math
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
+from concurrent.futures import Future
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Self
@@ -24,10 +26,15 @@ from arxiv_papers.query import (
     SearchPage,
     SearchPosition,
 )
+from arxiv_papers.runtime import DEFAULT_RUNTIME, DuckDBRuntimeConfig
 from arxiv_papers.snapshots import SnapshotCatalog, SnapshotCatalogError
 
 LOGGER = logging.getLogger(__name__)
 _CACHE_MISS = object()
+
+
+class _SnapshotRetired(QueryError):
+    """Internal signal to retry acquisition on the newly published generation."""
 
 
 class SnapshotResolutionError(RuntimeError):
@@ -58,11 +65,19 @@ class _SnapshotHandle:
     """Own a bounded pool of read-only connections for one immutable snapshot."""
 
     def __init__(
-        self, snapshot_path: Path, generation: str, max_connections: int
+        self,
+        snapshot_path: Path,
+        generation: str,
+        max_connections: int,
+        *,
+        pool_timeout_seconds: float,
+        runtime: DuckDBRuntimeConfig,
     ) -> None:
         self.snapshot_path = snapshot_path
         self.generation = generation
         self.max_connections = max_connections
+        self.pool_timeout_seconds = pool_timeout_seconds
+        self.runtime = runtime
         self._condition = threading.Condition()
         self._available: list[DuckDBQueryService] = []
         self._created = 0
@@ -71,30 +86,37 @@ class _SnapshotHandle:
 
     def acquire(self) -> _SnapshotLease:
         create_connection = False
+        started_at = time.monotonic()
+        deadline = started_at + self.pool_timeout_seconds
         with self._condition:
             while True:
                 if self._retiring:
-                    raise QueryError("snapshot generation is no longer active")
+                    raise _SnapshotRetired("snapshot generation is no longer active")
                 if self._available:
                     query = self._available.pop()
                     self._active += 1
+                    _log_pool_acquire(self.generation, started_at)
                     return _SnapshotLease(self, query)
                 if self._created < self.max_connections:
                     self._created += 1
                     self._active += 1
                     create_connection = True
                     break
-                self._condition.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise QueryError("MCP snapshot connection pool is saturated")
+                self._condition.wait(remaining)
 
         if create_connection:
             try:
-                query = DuckDBQueryService(self.snapshot_path)
+                query = DuckDBQueryService(self.snapshot_path, runtime=self.runtime)
             except Exception:
                 with self._condition:
                     self._created -= 1
                     self._active -= 1
                     self._condition.notify()
                 raise
+            _log_pool_acquire(self.generation, started_at)
             return _SnapshotLease(self, query)
         raise AssertionError("snapshot connection acquisition did not complete")
 
@@ -134,18 +156,24 @@ class _SnapshotManager:
         catalog: SnapshotCatalog | None,
         *,
         max_connections: int,
+        runtime: DuckDBRuntimeConfig,
     ) -> None:
         if max_connections < 1:
             raise ValueError("max_connections must be positive")
         self.catalog = catalog
         self.max_connections = max_connections
+        self.runtime = runtime
         self._lock = threading.Lock()
         self._closed = False
         self._current = _SnapshotHandle(
             snapshot_path,
             self._initial_generation(snapshot_path, catalog),
             max_connections,
+            pool_timeout_seconds=runtime.pool_timeout_seconds,
+            runtime=runtime,
         )
+        self._pointer_checked_at = 0.0
+        self._pointer_mtime_ns: int | None = None
 
     @staticmethod
     def _initial_generation(
@@ -173,13 +201,33 @@ class _SnapshotManager:
                 current = self._current
             try:
                 return current.acquire()
-            except QueryError:
+            except _SnapshotRetired:
                 # A refresh may retire the handle after it was observed.
                 continue
+
+    def generation(self) -> str:
+        """Return the current generation without consuming a pool slot."""
+
+        self._refresh()
+        with self._lock:
+            if self._closed:
+                raise QueryError("MCP snapshot manager is closed")
+            return self._current.generation
 
     def _refresh(self) -> None:
         if self.catalog is None:
             return
+        now = time.monotonic()
+        if now - self._pointer_checked_at < self.runtime.pointer_ttl_seconds:
+            return
+        self._pointer_checked_at = now
+        try:
+            mtime_ns = self.catalog.pointer_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        if mtime_ns is not None and mtime_ns == self._pointer_mtime_ns:
+            return
+        self._pointer_mtime_ns = mtime_ns
         try:
             pointer = self.catalog.read_current()
         except SnapshotCatalogError as error:
@@ -199,6 +247,8 @@ class _SnapshotManager:
                 pointer.snapshot_path,
                 pointer.generation,
                 self.max_connections,
+                pool_timeout_seconds=self.runtime.pool_timeout_seconds,
+                runtime=self.runtime,
             )
         current.retire()
 
@@ -219,24 +269,45 @@ class LocalArxivMCPServer:
         snapshot_path: Path | str,
         *,
         catalog: SnapshotCatalog | None = None,
-        max_connections: int = 8,
-        cache_size: int = 2048,
+        max_connections: int | None = None,
+        cache_size: int | None = None,
+        runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME,
     ) -> None:
-        if cache_size < 0:
+        effective_connections = (
+            runtime.max_connections if max_connections is None else max_connections
+        )
+        effective_cache_bytes = (
+            runtime.paper_cache_bytes if cache_size is None else cache_size
+        )
+        if effective_cache_bytes < 0:
             raise ValueError("cache_size must be non-negative")
         initial_path = Path(snapshot_path)
         self.catalog = catalog
         self._snapshots = _SnapshotManager(
             initial_path,
             catalog,
-            max_connections=max_connections,
+            max_connections=effective_connections,
+            runtime=runtime,
         )
-        self._cache_size = cache_size
+        self._cache_size_bytes = effective_cache_bytes
+        self._search_cache_size = runtime.search_cache_size
+        self._search_cache_ttl = runtime.search_cache_ttl_seconds
         self._cache_lock = threading.Lock()
         self._paper_cache: OrderedDict[
             tuple[str, str, int | None], dict[str, object] | None
         ] = OrderedDict()
-        self._inflight: dict[tuple[str, str, int | None], threading.Lock] = {}
+        self._paper_cache_sizes: dict[tuple[str, str, int | None], int] = {}
+        self._paper_cache_bytes = 0
+        self._search_cache: OrderedDict[
+            str, tuple[float, dict[str, Any], int]
+        ] = OrderedDict()
+        self._search_cache_bytes = 0
+        # Coalesce identical paper requests before they acquire a snapshot
+        # connection.  This prevents a burst of duplicate model calls from
+        # occupying every pool slot while waiting for the first query.
+        self._inflight: dict[
+            tuple[str, str, int | None], Future[dict[str, object] | None]
+        ] = {}
         self.server = MCPServer(
             name="arxiv-papers",
             version="0.1.0",
@@ -317,6 +388,27 @@ class LocalArxivMCPServer:
         """Search local current papers using keyword and structured filters."""
 
         with self._snapshots.acquire() as lease:
+            search_key = self._search_key(
+                "search",
+                {
+                    "query": query,
+                    "author": author,
+                    "category": category,
+                    "primary_only": primary_only,
+                    "created_from": created_from,
+                    "created_until": created_until,
+                    "updated_from": updated_from,
+                    "updated_until": updated_until,
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+                lease.generation,
+            )
+            cached_page = self._search_cache_get(search_key)
+            if cached_page is not _CACHE_MISS:
+                assert isinstance(cached_page, dict)
+                LOGGER.debug("mcp_search_cache_hit", extra={"generation": lease.generation})
+                return cached_page
             fingerprint = self._cursor_fingerprint(
                 {
                     "query": query,
@@ -331,6 +423,7 @@ class LocalArxivMCPServer:
                 snapshot_identity=lease.generation,
             )
             after = _decode_cursor(cursor, fingerprint)
+            started_at = time.monotonic()
             page = lease.query.search_papers(
                 query=query,
                 author=author,
@@ -343,33 +436,64 @@ class LocalArxivMCPServer:
                 limit=limit,
                 after=after,
             )
-        return _page_payload(page, fingerprint)
+            LOGGER.debug(
+                "mcp_search_completed",
+                extra={
+                    "generation": lease.generation,
+                    "elapsed_seconds": round(time.monotonic() - started_at, 6),
+                    "items": len(page.items),
+                },
+            )
+        payload = _page_payload(page, fingerprint)
+        self._search_cache_put(search_key, payload)
+        return payload
 
     def get_paper(self, arxiv_id: str, version: int | None = None) -> dict[str, Any]:
         """Get one current local paper and its available version facts."""
 
         canonical_id = arxiv_id.strip()
-        with self._snapshots.acquire() as lease:
-            key = (lease.generation, canonical_id, version)
-            cached = self._cache_get(key)
-            if cached is not _CACHE_MISS:
-                return {"paper": cached}
+        # Resolve generation without acquiring a DB connection.  Generation is
+        # part of the key so a publication during an in-flight request cannot
+        # make callers for the new snapshot reuse an old result.
+        generation = self._snapshots.generation()
+        request_key = (generation, canonical_id, version)
+        cached = self._cache_get(request_key)
+        if cached is not _CACHE_MISS:
+            return {"paper": cached}
+        with self._cache_lock:
+            future = self._inflight.get(request_key)
+            owner = future is None
+            if owner:
+                future = Future()
+                self._inflight[request_key] = future
 
-            key_lock = self._get_inflight_lock(key)
-            try:
-                with key_lock:
-                    cached = self._cache_get(key)
-                    if cached is not _CACHE_MISS:
-                        return {"paper": cached}
+        assert future is not None
+        if not owner:
+            # Waiting happens without holding a snapshot lease, so duplicate
+            # requests cannot consume connection-pool capacity.
+            paper = future.result()
+            return {"paper": copy.deepcopy(paper)}
+
+        try:
+            with self._snapshots.acquire() as lease:
+                cache_key = (lease.generation, canonical_id, version)
+                cached = self._cache_get(cache_key)
+                if cached is _CACHE_MISS:
                     paper = _jsonable(
                         lease.query.get_paper(canonical_id, version=version)
                     )
-                    self._cache_put(key, paper)
-                    return {"paper": copy.deepcopy(paper)}
-            finally:
-                with self._cache_lock:
-                    if self._inflight.get(key) is key_lock:
-                        self._inflight.pop(key, None)
+                    self._cache_put(cache_key, paper)
+                else:
+                    paper = cached
+            future.set_result(paper)
+            return {"paper": copy.deepcopy(paper)}
+        except BaseException as error:
+            future.set_exception(error)
+            raise
+        finally:
+            with self._cache_lock:
+                if self._inflight.get(request_key) is future:
+                    self._inflight.pop(request_key, None)
 
     def get_papers(
         self, arxiv_ids: list[str], version: int | None = None
@@ -419,12 +543,21 @@ class LocalArxivMCPServer:
         """Search local current papers by normalized author display name."""
 
         with self._snapshots.acquire() as lease:
+            search_key = self._search_key(
+                "author", {"author": author, "limit": limit, "cursor": cursor}, lease.generation
+            )
+            cached_page = self._search_cache_get(search_key)
+            if cached_page is not _CACHE_MISS:
+                assert isinstance(cached_page, dict)
+                return cached_page
             fingerprint = self._cursor_fingerprint(
                 {"author": author}, snapshot_identity=lease.generation
             )
             after = _decode_cursor(cursor, fingerprint)
             page = lease.query.search_by_author(author, limit=limit, after=after)
-        return _page_payload(page, fingerprint)
+        payload = _page_payload(page, fingerprint)
+        self._search_cache_put(search_key, payload)
+        return payload
 
     def search_by_category(
         self,
@@ -436,6 +569,20 @@ class LocalArxivMCPServer:
         """Search local current papers by exact category or category prefix."""
 
         with self._snapshots.acquire() as lease:
+            search_key = self._search_key(
+                "category",
+                {
+                    "category": category,
+                    "primary_only": primary_only,
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+                lease.generation,
+            )
+            cached_page = self._search_cache_get(search_key)
+            if cached_page is not _CACHE_MISS:
+                assert isinstance(cached_page, dict)
+                return cached_page
             fingerprint = self._cursor_fingerprint(
                 {"category": category, "primary_only": primary_only},
                 snapshot_identity=lease.generation,
@@ -447,7 +594,9 @@ class LocalArxivMCPServer:
                 limit=limit,
                 after=after,
             )
-        return _page_payload(page, fingerprint)
+        payload = _page_payload(page, fingerprint)
+        self._search_cache_put(search_key, payload)
+        return payload
 
     def library_status(self) -> dict[str, Any]:
         """Return local snapshot metadata without contacting the network."""
@@ -481,7 +630,7 @@ class LocalArxivMCPServer:
     def _cache_get(
         self, key: tuple[str, str, int | None]
     ) -> dict[str, object] | None | object:
-        if self._cache_size == 0:
+        if self._cache_size_bytes == 0:
             return _CACHE_MISS
         with self._cache_lock:
             if key not in self._paper_cache:
@@ -493,17 +642,64 @@ class LocalArxivMCPServer:
     def _cache_put(
         self, key: tuple[str, str, int | None], value: dict[str, object] | None
     ) -> None:
-        if self._cache_size == 0:
+        if self._cache_size_bytes == 0:
             return
         with self._cache_lock:
-            self._paper_cache[key] = copy.deepcopy(value)
+            self._paper_cache.pop(key, None)
+            self._paper_cache_bytes -= self._paper_cache_sizes.pop(key, 0)
+            cached = copy.deepcopy(value)
+            self._paper_cache[key] = cached
+            size = _estimate_json_bytes(cached)
+            self._paper_cache_sizes[key] = size
+            self._paper_cache_bytes += size
             self._paper_cache.move_to_end(key)
-            while len(self._paper_cache) > self._cache_size:
-                self._paper_cache.popitem(last=False)
+            while self._paper_cache and self._paper_cache_bytes > self._cache_size_bytes:
+                removed_key, _ = self._paper_cache.popitem(last=False)
+                self._paper_cache_bytes -= self._paper_cache_sizes.pop(
+                    removed_key, 0
+                )
 
-    def _get_inflight_lock(self, key: tuple[str, str, int | None]) -> threading.Lock:
+    @staticmethod
+    def _search_key(operation: str, payload: Mapping[str, object], generation: str) -> str:
+        return json.dumps(
+            {"operation": operation, "generation": generation, **payload},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _search_cache_get(self, key: str) -> dict[str, Any] | object:
+        if self._search_cache_size == 0:
+            return _CACHE_MISS
+        now = time.monotonic()
         with self._cache_lock:
-            return self._inflight.setdefault(key, threading.Lock())
+            cached = self._search_cache.get(key)
+            if cached is None:
+                return _CACHE_MISS
+            created, value, size = cached
+            if now - created >= self._search_cache_ttl:
+                self._search_cache.pop(key, None)
+                self._search_cache_bytes -= size
+                return _CACHE_MISS
+            self._search_cache.move_to_end(key)
+            return copy.deepcopy(value)
+
+    def _search_cache_put(self, key: str, value: dict[str, Any]) -> None:
+        if self._search_cache_size == 0:
+            return
+        cached = copy.deepcopy(value)
+        size = _estimate_json_bytes(cached)
+        with self._cache_lock:
+            previous = self._search_cache.pop(key, None)
+            if previous is not None:
+                self._search_cache_bytes -= previous[2]
+            self._search_cache[key] = (time.monotonic(), cached, size)
+            self._search_cache_bytes += size
+            self._search_cache.move_to_end(key)
+            while len(self._search_cache) > self._search_cache_size:
+                _, removed = self._search_cache.popitem(last=False)
+                self._search_cache_bytes -= removed[2]
 
 
 def resolve_snapshot_path(
@@ -599,6 +795,15 @@ def _same_path(left: Path, right: Path) -> bool:
     return left.resolve() == right.resolve()
 
 
+def _log_pool_acquire(generation: str, started_at: float) -> None:
+    wait_seconds = time.monotonic() - started_at
+    if wait_seconds >= 0.001:
+        LOGGER.debug(
+            "mcp_pool_acquired",
+            extra={"generation": generation, "wait_seconds": round(wait_seconds, 6)},
+        )
+
+
 def _page_payload(page: SearchPage, fingerprint: str) -> dict[str, Any]:
     items = [_jsonable(item) for item in page.items]
     next_cursor = (
@@ -671,6 +876,10 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, tuple | list):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _estimate_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
 
 
 __all__ = [

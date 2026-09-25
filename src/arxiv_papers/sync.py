@@ -24,8 +24,14 @@ from arxiv_papers.metadata import (
 )
 from arxiv_papers.oai import OAIClient, OAIPage, OAIProtocolError
 from arxiv_papers.progress import ProgressDisplay
+from arxiv_papers.runtime import DEFAULT_RUNTIME, DuckDBRuntimeConfig
 from arxiv_papers.snapshots import SnapshotCatalog
-from arxiv_papers.state import SyncContext, SyncStateStore, overlap_datestamp
+from arxiv_papers.state import (
+    SyncCheckpointSession,
+    SyncContext,
+    SyncStateStore,
+    overlap_datestamp,
+)
 from arxiv_papers.storage import (
     DuckDBSnapshotBuilder,
     ParquetBatchStore,
@@ -107,15 +113,17 @@ class FullSyncRunner:
         overlap_days: int = 3,
         progress: ProgressDisplay | None = None,
         snapshot_retention: int = 3,
+        runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME,
     ) -> None:
         if overlap_days < 0:
             raise ValueError("overlap_days must be non-negative")
         self.client = client
         self.data_dir = Path(data_dir)
+        self.runtime = runtime
         self.archive = archive or RawXMLArchive(self.data_dir / "raw")
-        self.snapshot_builder = snapshot_builder or DuckDBSnapshotBuilder()
+        self.snapshot_builder = snapshot_builder or DuckDBSnapshotBuilder(runtime)
         self.state_store = state_store or SyncStateStore(
-            self.data_dir / "state" / "sync.duckdb"
+            self.data_dir / "state" / "sync.duckdb", runtime=runtime
         )
         self.overlap_days = overlap_days
         self.progress = progress
@@ -282,68 +290,104 @@ class FullSyncRunner:
             raise TypeError("client_pages must be iterable")
         page_number = start_page
         page_iterator = iter(client_pages)
-        while True:
-            if self.progress is not None:
-                self.progress.requesting(page_number=page_number)
-            try:
-                page = next(page_iterator)
-            except StopIteration:
-                break
-            stats.pages += 1
-            stats.records += len(page.records)
-            request_params = dict(page.request_params)
-            self.state_store.begin_batch(
-                run_id=run_id,
-                page_number=page_number,
-                request_params=request_params,
-            )
-            archive_entry = self.archive.save_response(
-                run_id=run_id,
-                page_number=page_number,
-                raw_xml=page.raw_xml,
-                request_params=request_params,
-                run_date=run_date,
-                http_status=page.http_status,
-                elapsed_seconds=page.elapsed_seconds,
-            )
-            parse_errors_before = stats.parse_errors
-            parsed_records = self._parse_page_records(
-                page=page,
-                page_number=page_number,
-                run_id=run_id,
-                store=store,
-                archive_entry=archive_entry,
-                stats=stats,
-                scope=scope,
-            )
-            store.write_page(page_number, parsed_records)
-            max_datestamp = _max_datestamp(page)
-            page_parse_errors = stats.parse_errors - parse_errors_before
-            self.state_store.complete_batch(
-                run_id=run_id,
-                page_number=page_number,
-                response_sha256=archive_entry.sha256,
-                records=len(page.records),
-                parsed_records=len(parsed_records),
-                parse_errors=page_parse_errors,
-                warnings=sum(len(record.warnings) for record in parsed_records),
-                max_datestamp=max_datestamp,
-                next_resumption_token=page.resumption_token,
-                sync_name=sync_name,
-            )
+        store.cleanup_after_page(start_page - 1)
+        batch_records: list[ParsedArxivRecord] = []
+        batch_pages: list[dict[str, object]] = []
+        batch_records_count = 0
+        batch_bytes = 0
+
+        def flush_batch() -> None:
+            nonlocal batch_records, batch_pages, batch_records_count, batch_bytes
+            if not batch_pages:
+                return
+            store.write_batch(int(str(batch_pages[-1]["page_number"])), batch_records)
+            checkpoint.complete_pages(batch_pages)
             LOGGER.info(
-                "full_sync_page_checkpointed",
+                "sync_batch_checkpointed",
                 extra={
                     "run_id": run_id,
-                    "page_number": page_number,
-                    "records": len(page.records),
-                    "parsed_records": len(parsed_records),
-                    "next_resumption_token": bool(page.resumption_token),
+                    "first_page": batch_pages[0]["page_number"],
+                    "last_page": batch_pages[-1]["page_number"],
+                    "pages": len(batch_pages),
+                    "records": batch_records_count,
                 },
             )
-            if self.progress is not None:
-                self.progress.update(page, page_number=page_number)
-            page_number += 1
+            batch_records = []
+            batch_pages = []
+            batch_records_count = 0
+            batch_bytes = 0
+
+        with self.state_store.checkpoint_session(
+            run_id=run_id, sync_name=sync_name, runtime=self.runtime
+        ) as checkpoint:
+            while True:
+                if self.progress is not None:
+                    self.progress.requesting(page_number=page_number)
+                try:
+                    page = next(page_iterator)
+                except StopIteration:
+                    break
+                stats.pages += 1
+                stats.records += len(page.records)
+                request_params = dict(page.request_params)
+                checkpoint.begin_page(
+                    page_number=page_number, request_params=request_params
+                )
+                archive_entry = self.archive.save_response(
+                    run_id=run_id,
+                    page_number=page_number,
+                    raw_xml=page.raw_xml,
+                    request_params=request_params,
+                    run_date=run_date,
+                    http_status=page.http_status,
+                    elapsed_seconds=page.elapsed_seconds,
+                )
+                parse_errors_before = stats.parse_errors
+                parsed_records = self._parse_page_records(
+                    page=page,
+                    page_number=page_number,
+                    run_id=run_id,
+                    store=store,
+                    archive_entry=archive_entry,
+                    stats=stats,
+                    scope=scope,
+                    checkpoint=checkpoint,
+                )
+                batch_records.extend(parsed_records)
+                page_parse_errors = stats.parse_errors - parse_errors_before
+                batch_pages.append(
+                    {
+                        "page_number": page_number,
+                        "response_sha256": archive_entry.sha256,
+                        "records": len(page.records),
+                        "parsed_records": len(parsed_records),
+                        "parse_errors": page_parse_errors,
+                        "warnings": sum(len(record.warnings) for record in parsed_records),
+                        "max_datestamp": _max_datestamp(page),
+                        "next_resumption_token": page.resumption_token,
+                    }
+                )
+                batch_records_count += len(parsed_records)
+                batch_bytes += len(page.raw_xml)
+                LOGGER.info(
+                    "full_sync_page_staged",
+                    extra={
+                        "run_id": run_id,
+                        "page_number": page_number,
+                        "records": len(page.records),
+                        "parsed_records": len(parsed_records),
+                    },
+                )
+                if self.progress is not None:
+                    self.progress.update(page, page_number=page_number)
+                page_number += 1
+                if (
+                    len(batch_pages) >= self.runtime.checkpoint_pages
+                    or batch_records_count >= self.runtime.checkpoint_records
+                    or batch_bytes >= self.runtime.checkpoint_bytes
+                ):
+                    flush_batch()
+            flush_batch()
         return page_number
 
     def _complete_run(
@@ -359,9 +403,33 @@ class FullSyncRunner:
     ) -> FullSyncResult:
         store.finalize()
         snapshot_path = self.data_dir / "duckdb" / f"library-{context.run_id}.duckdb"
-        snapshot = self.snapshot_builder.build(
-            parquet_root, snapshot_path, base_snapshot=base_snapshot
-        )
+        if base_snapshot is not None:
+            change_ratio = self.snapshot_builder.incremental_change_ratio(
+                parquet_root, base_snapshot
+            )
+            if (
+                change_ratio <= 0.10
+                and self.snapshot_builder.supports_incremental_patch(base_snapshot)
+            ):
+                LOGGER.info(
+                    "incremental_snapshot_patch_started",
+                    extra={"run_id": context.run_id, "change_ratio": change_ratio},
+                )
+                snapshot = self.snapshot_builder.build_incremental(
+                    parquet_root, snapshot_path, base_snapshot=base_snapshot
+                )
+            else:
+                LOGGER.info(
+                    "incremental_snapshot_full_rebuild",
+                    extra={"run_id": context.run_id, "change_ratio": change_ratio},
+                )
+                snapshot = self.snapshot_builder.build(
+                    parquet_root, snapshot_path, base_snapshot=base_snapshot
+                )
+        else:
+            snapshot = self.snapshot_builder.build(
+                parquet_root, snapshot_path, base_snapshot=None
+            )
         stats.update_client_metrics(self.client, started_at)
         self.snapshot_catalog.publish(
             snapshot.path,
@@ -398,6 +466,7 @@ class FullSyncRunner:
         archive_entry: RawArchiveEntry,
         stats: SyncStats,
         scope: PaperScope,
+        checkpoint: SyncCheckpointSession | None = None,
     ) -> list[ParsedArxivRecord]:
         parsed_records: list[ParsedArxivRecord] = []
         for record in page.records:
@@ -410,14 +479,23 @@ class FullSyncRunner:
                     oai_identifier=record.identifier,
                     error=error,
                 )
-                self.state_store.record_dead_letter(
-                    run_id=run_id,
-                    page_number=page_number,
-                    oai_identifier=record.identifier,
-                    error_type=type(error).__name__,
-                    error=str(error),
-                    raw_xml_path=archive_entry.xml_path,
-                )
+                if checkpoint is not None:
+                    checkpoint.record_dead_letter(
+                        page_number=page_number,
+                        oai_identifier=record.identifier,
+                        error_type=type(error).__name__,
+                        error=str(error),
+                        raw_xml_path=archive_entry.xml_path,
+                    )
+                else:
+                    self.state_store.record_dead_letter(
+                        run_id=run_id,
+                        page_number=page_number,
+                        oai_identifier=record.identifier,
+                        error_type=type(error).__name__,
+                        error=str(error),
+                        raw_xml_path=archive_entry.xml_path,
+                    )
                 LOGGER.error(
                     "metadata_record_parse_failed",
                     extra={

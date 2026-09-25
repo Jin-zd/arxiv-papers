@@ -25,6 +25,7 @@ class ProgressDisplay:
     current_page_bytes: int = field(default=0, init=False)
     _saw_stream_bytes: bool = field(default=False, init=False)
     _last_line_length: int = field(default=0, init=False)
+    _last_render_at: float = field(default=0.0, init=False)
 
     def requesting(self, *, page_number: int) -> None:
         """Show immediate feedback while the next OAI page is in flight."""
@@ -32,6 +33,7 @@ class ProgressDisplay:
         self.current_page = page_number
         self.current_page_bytes = 0
         self._saw_stream_bytes = False
+        self._last_render_at = time.monotonic()
         line = f"requesting OAI page {page_number} ..."
         padding = max(0, self._last_line_length - len(line))
         self.stream.write(f"\r{line}{' ' * padding}")
@@ -46,6 +48,9 @@ class ProgressDisplay:
         self.downloaded_bytes += count
         self.current_page_bytes += count
         self._saw_stream_bytes = True
+        now = time.monotonic()
+        if now - self._last_render_at < 0.1 and self.current_page_bytes < 1024 * 1024:
+            return
         elapsed = max(time.monotonic() - self.started_at, 0.001)
         speed = self.downloaded_bytes / elapsed
         page = self.current_page or 0
@@ -58,6 +63,7 @@ class ProgressDisplay:
         self.stream.write(f"\r{line}{' ' * padding}")
         self.stream.flush()
         self._last_line_length = len(line)
+        self._last_render_at = now
 
     def start(self) -> None:
         """Reset counters when a runner is reused for another sync."""
@@ -71,6 +77,7 @@ class ProgressDisplay:
         self.current_page_bytes = 0
         self._saw_stream_bytes = False
         self._last_line_length = 0
+        self._last_render_at = 0.0
 
     def update(self, page: OAIPage, *, page_number: int) -> None:
         """Record one checkpointed page and redraw the progress line."""

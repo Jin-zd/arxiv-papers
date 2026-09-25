@@ -30,7 +30,7 @@ _BASE_SNAPSHOT_TABLES = (
     "library_metadata",
 )
 _SEARCH_SNAPSHOT_TABLES = ("paper_search", "search_metadata")
-_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"4"})
+_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"4", "5"})
 
 
 @dataclass(frozen=True, slots=True)

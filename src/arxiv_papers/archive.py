@@ -71,9 +71,7 @@ class RawXMLArchive:
         xml_path = run_dir / f"{basename}.xml.zst"
         metadata_path = run_dir / f"{basename}.json"
         sha256 = hashlib.sha256(raw_xml).hexdigest()
-        compressed = zstandard.ZstdCompressor(level=self.compression_level).compress(
-            raw_xml
-        )
+        compressed_size = _atomic_write_zstd(xml_path, raw_xml, self.compression_level)
 
         metadata: dict[str, object] = {
             "run_id": safe_run_id,
@@ -82,14 +80,13 @@ class RawXMLArchive:
             "received_at": datetime.now(UTC).isoformat(),
             "sha256": sha256,
             "size_bytes": len(raw_xml),
-            "compressed_size_bytes": len(compressed),
+            "compressed_size_bytes": compressed_size,
         }
         if http_status is not None:
             metadata["http_status"] = http_status
         if elapsed_seconds is not None:
             metadata["elapsed_seconds"] = elapsed_seconds
 
-        _atomic_write_bytes(xml_path, compressed)
         _atomic_write_bytes(
             metadata_path,
             json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True).encode(
@@ -109,7 +106,10 @@ class RawXMLArchive:
 
         response_path = Path(path)
         try:
-            return zstandard.ZstdDecompressor().decompress(response_path.read_bytes())
+            with response_path.open("rb") as source, zstandard.ZstdDecompressor().stream_reader(
+                source
+            ) as reader:
+                return reader.read()
         except (OSError, zstandard.ZstdError) as exc:
             raise RawArchiveError(
                 f"could not read archived response {response_path}: {exc}"
@@ -139,6 +139,35 @@ def _atomic_write_bytes(path: Path, content: bytes) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
     except OSError as exc:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise RawArchiveError(f"could not atomically write {path}: {exc}") from exc
+
+
+def _atomic_write_zstd(path: Path, content: bytes, level: int) -> int:
+    """Compress directly into the temporary file to avoid a second full buffer."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            with zstandard.ZstdCompressor(level=level).stream_writer(
+                temporary, closefd=False
+            ) as compressor:
+                compressor.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            compressed_size = temporary.tell()
+        os.replace(temporary_path, path)
+        return compressed_size
+    except (OSError, zstandard.ZstdError) as exc:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise RawArchiveError(f"could not atomically write {path}: {exc}") from exc

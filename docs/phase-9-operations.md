@@ -4,6 +4,21 @@
 Parquet compact 和外部调度计划。调度器只生成可审查的 cron/launchd 参数，不在
 MCP 进程中启动常驻线程。
 
+## 本地查询运行参数
+
+MCP 查询连接默认使用 2 个 DuckDB worker、最多 8 个连接，每连接内存上限为
+`1536MB`，临时文件写入 `/tmp/arxiv-papers-duckdb`。可通过环境变量调整：
+
+- `ARXIV_DUCKDB_QUERY_THREADS` / `ARXIV_DUCKDB_BUILD_THREADS`
+- `ARXIV_DUCKDB_QUERY_MEMORY` / `ARXIV_DUCKDB_BUILD_MEMORY`
+- `ARXIV_DUCKDB_TEMP_DIR`
+- `ARXIV_MCP_MAX_CONNECTIONS` / `ARXIV_MCP_POOL_TIMEOUT`
+- `ARXIV_MCP_PAPER_CACHE_BYTES` / `ARXIV_MCP_SEARCH_CACHE_SIZE`
+- `ARXIV_SYNC_CHECKPOINT_PAGES` / `ARXIV_SYNC_CHECKPOINT_RECORDS`
+
+查询快照必须包含 DuckDB FTS 扩展。构建快照时会自动加载或安装匹配版本的
+扩展；安装失败会终止构建，不再静默降级到 `ILIKE` 全表搜索。
+
 ## 结构化日志与指标
 
 同步命令默认把 JSON 日志写到 stderr。使用 `--log-file` 可以同时写入 JSONL 文件：

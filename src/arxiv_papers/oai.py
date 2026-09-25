@@ -194,7 +194,8 @@ class OAIClient:
 
     A client instance owns one ``httpx.Client`` and should be used as a
     context manager.  The iterator yields one page at a time, allowing the
-    caller to archive and commit each page before requesting the next one.
+    caller to archive each page and checkpoint a bounded batch before requesting
+    the next pages.
     """
 
     def __init__(
@@ -370,18 +371,22 @@ class OAIClient:
         with self._http.stream(
             "GET", self.config.endpoint, params=dict(params)
         ) as response:
-            content = bytearray()
+            chunks: list[bytes] = []
+            content_size = 0
             self.metrics.requests += 1
             for chunk in response.iter_bytes():
-                content.extend(chunk)
+                chunks.append(chunk)
+                content_size += len(chunk)
                 self.metrics.response_bytes += len(chunk)
                 if self._on_bytes_received is not None:
                     self._on_bytes_received(len(chunk))
-                if len(content) > self.config.max_response_bytes:
+                if content_size > self.config.max_response_bytes:
                     raise OAITransportError(
                         "response exceeds "
                         f"max_response_bytes={self.config.max_response_bytes}"
                     )
+            content = b"".join(chunks)
+            chunks.clear()
             return httpx.Response(
                 status_code=response.status_code,
                 headers=response.headers,
