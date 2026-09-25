@@ -482,9 +482,11 @@ class LocalArxivMCPServer:
                     paper = _jsonable(
                         lease.query.get_paper(canonical_id, version=version)
                     )
+                    assert paper is None or isinstance(paper, dict)
                     self._cache_put(cache_key, paper)
                 else:
                     paper = cached
+                    assert paper is None or isinstance(paper, dict)
             future.set_result(paper)
             return {"paper": copy.deepcopy(paper)}
         except BaseException as error:

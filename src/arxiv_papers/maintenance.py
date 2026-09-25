@@ -295,9 +295,7 @@ def _snapshot_counts(path: Path) -> dict[str, int]:
     try:
         with duckdb.connect(str(path), read_only=True) as connection:
             return {
-                table: int(
-                    connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                )
+                table: _count_table(connection, table)
                 for table in (
                     "papers",
                     "paper_versions",
@@ -308,6 +306,11 @@ def _snapshot_counts(path: Path) -> dict[str, int]:
             }
     except duckdb.Error as error:
         raise SnapshotCatalogError(f"cannot read snapshot counts: {path}") from error
+
+
+def _count_table(connection: duckdb.DuckDBPyConnection, table: str) -> int:
+    row = connection.execute(f"SELECT count(*) FROM {table}").fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def _coerce_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:

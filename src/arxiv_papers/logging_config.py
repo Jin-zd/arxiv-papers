@@ -14,7 +14,7 @@ class JsonFormatter(logging.Formatter):
     """Render one JSON object per log record."""
 
     _reserved: ClassVar[set[str]] = set(
-        logging.LogRecord(None, 0, "", 0, "", (), None).__dict__
+        logging.LogRecord("", 0, "", 0, "", (), None).__dict__
     )
 
     def format(self, record: logging.LogRecord) -> str:

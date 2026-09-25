@@ -22,6 +22,19 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return parsed
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number") from error
+    if parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class DuckDBRuntimeConfig:
     """Bounded defaults for the 20-core/24-GB local deployment."""
@@ -53,19 +66,15 @@ class DuckDBRuntimeConfig:
             build_memory_limit=os.environ.get("ARXIV_DUCKDB_BUILD_MEMORY", "12GB"),
             temp_directory=Path(temp).expanduser() if temp else None,
             max_connections=_env_int("ARXIV_MCP_MAX_CONNECTIONS", 8),
-            pool_timeout_seconds=float(
-                os.environ.get("ARXIV_MCP_POOL_TIMEOUT", "5")
-            ),
-            pointer_ttl_seconds=float(
-                os.environ.get("ARXIV_MCP_POINTER_TTL", "1")
-            ),
+            pool_timeout_seconds=_env_float("ARXIV_MCP_POOL_TIMEOUT", 5.0),
+            pointer_ttl_seconds=_env_float("ARXIV_MCP_POINTER_TTL", 1.0),
             paper_cache_bytes=_env_int(
-                "ARXIV_MCP_PAPER_CACHE_BYTES", 128 * 1024 * 1024
+                "ARXIV_MCP_PAPER_CACHE_BYTES", 128 * 1024 * 1024, minimum=0
             ),
-            search_cache_size=_env_int("ARXIV_MCP_SEARCH_CACHE_SIZE", 256),
-            search_cache_ttl_seconds=float(
-                os.environ.get("ARXIV_MCP_SEARCH_CACHE_TTL", "5")
+            search_cache_size=_env_int(
+                "ARXIV_MCP_SEARCH_CACHE_SIZE", 256, minimum=0
             ),
+            search_cache_ttl_seconds=_env_float("ARXIV_MCP_SEARCH_CACHE_TTL", 5.0),
             checkpoint_pages=_env_int("ARXIV_SYNC_CHECKPOINT_PAGES", 10),
             checkpoint_records=_env_int("ARXIV_SYNC_CHECKPOINT_RECORDS", 50_000),
             checkpoint_bytes=_env_int(

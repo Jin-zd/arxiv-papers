@@ -50,6 +50,9 @@ data/state/sync.duckdb
 MCP 默认在每个请求边界检查该指针并切换 generation；显式指定 `--snapshot` 时固定使用
 指定文件。
 
+状态数据库的表结构只在同步写入路径中初始化或迁移；`sync status`、`sync verify` 和
+运维检查使用只读连接，不会与正在进行的同步任务争抢写锁。
+
 ## 常用命令
 
 ```bash

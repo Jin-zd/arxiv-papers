@@ -248,6 +248,32 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
     if not abstract:
         warnings.append("missing abstract")
 
+    authors, authors_raw = _parse_authors(root, warnings)
+    categories = _parse_categories(root, warnings)
+    version_history = _parse_version_history(root, warnings)
+    created, updated = _parse_dates(root, version_history, warnings)
+
+    return _XMLFields(
+        title=title,
+        abstract=abstract,
+        authors=authors,
+        categories=categories,
+        created=created,
+        updated=updated,
+        comments=_optional_text(root, "comments"),
+        journal_ref=_optional_text(root, "journal-ref"),
+        doi=_normalize_doi(_optional_text(root, "doi")),
+        license=_optional_text(root, "license"),
+        report_numbers=_split_optional_field(root, "report-no"),
+        authors_raw=authors_raw,
+        version_history=version_history,
+        warnings=tuple(warnings),
+    )
+
+
+def _parse_authors(
+    root: etree._Element, warnings: list[str]
+) -> tuple[tuple[ArxivAuthor, ...], str | None]:
     authors: list[ArxivAuthor] = []
     authors_raw: str | None = None
     authors_element = _find_child(root, "authors")
@@ -266,7 +292,12 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
                 authors.extend(_parse_raw_authors(authors_raw))
     if not authors:
         warnings.append("missing authors")
+    return tuple(authors), authors_raw
 
+
+def _parse_categories(
+    root: etree._Element, warnings: list[str]
+) -> tuple[ArxivCategory, ...]:
     categories_text = _normalized_field(root, "categories")
     categories = tuple(
         ArxivCategory(name=category, is_primary=index == 0)
@@ -276,8 +307,14 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
     )
     if not categories:
         warnings.append("missing categories")
+    return categories
 
-    version_history = _parse_version_history(root, warnings)
+
+def _parse_dates(
+    root: etree._Element,
+    version_history: tuple[ArxivVersionHistory, ...],
+    warnings: list[str],
+) -> tuple[date | None, date | None]:
     created, created_warning = _parse_date_field(root, "created")
     if created is None and version_history:
         created = version_history[0].submitted_at.date()
@@ -290,23 +327,7 @@ def _parse_fields(root: etree._Element) -> _XMLFields:
         warnings.append(created_warning)
     if updated_warning:
         warnings.append(updated_warning)
-
-    return _XMLFields(
-        title=title,
-        abstract=abstract,
-        authors=tuple(authors),
-        categories=categories,
-        created=created,
-        updated=updated,
-        comments=_optional_text(root, "comments"),
-        journal_ref=_optional_text(root, "journal-ref"),
-        doi=_normalize_doi(_optional_text(root, "doi")),
-        license=_optional_text(root, "license"),
-        report_numbers=_split_optional_field(root, "report-no"),
-        authors_raw=authors_raw,
-        version_history=version_history,
-        warnings=tuple(warnings),
-    )
+    return created, updated
 
 
 def _parse_raw_authors(value: str) -> list[ArxivAuthor]:

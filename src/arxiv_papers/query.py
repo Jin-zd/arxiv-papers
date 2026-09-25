@@ -88,16 +88,12 @@ class DuckDBQueryService:
         if self.fts_enabled:
             try:
                 self.connection.execute("LOAD fts")
-            except duckdb.Error:
-                try:
-                    self.connection.execute("INSTALL fts")
-                    self.connection.execute("LOAD fts")
-                except duckdb.Error as error:
-                    self.connection.close()
-                    raise QueryError(
-                        "snapshot requires the DuckDB FTS extension; "
-                        "install the matching extension"
-                    ) from error
+            except duckdb.Error as error:
+                self.connection.close()
+                raise QueryError(
+                    "snapshot requires the DuckDB FTS extension; "
+                    "install the matching extension before querying"
+                ) from error
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
@@ -150,44 +146,18 @@ class DuckDBQueryService:
                     "rebuild it with the DuckDB FTS extension"
                 )
 
-        if author:
-            conditions.append(
-                "EXISTS ("
-                "SELECT 1 FROM paper_authors pa "
-                "JOIN authors a ON a.author_key = pa.author_key "
-                "WHERE pa.arxiv_id = p.arxiv_id "
-                "AND pa.version IS NOT DISTINCT FROM p.version "
-                f"AND {self._author_name_expression()} LIKE ?"
-                ")"
-            )
-            parameters.append(f"%{_normalize_search_text(author)}%")
-
-        if category:
-            category_condition = "c.category = ?"
-            category_parameters: list[object] = [category]
-            if category.endswith("."):
-                category_condition = "c.category LIKE ?"
-                category_parameters = [f"{category}%"]
-            conditions.append(
-                "EXISTS ("
-                "SELECT 1 FROM categories c "
-                "WHERE c.arxiv_id = p.arxiv_id "
-                "AND c.version IS NOT DISTINCT FROM p.version "
-                f"AND {category_condition}"
-                + (" AND c.is_primary" if primary_only else "")
-                + ")"
-            )
-            parameters.extend(category_parameters)
-
-        for column, value, operator in (
-            ("created", created_from, ">="),
-            ("created", created_until, "<="),
-            ("updated", updated_from, ">="),
-            ("updated", updated_until, "<="),
-        ):
-            if value is not None:
-                conditions.append(f"p.{column} {operator} ?")
-                parameters.append(_date_value(value))
+        filter_conditions, filter_parameters = _structured_filters(
+            author=author,
+            category=category,
+            primary_only=primary_only,
+            author_name_expression=self._author_name_expression(),
+            created_from=created_from,
+            created_until=created_until,
+            updated_from=updated_from,
+            updated_until=updated_until,
+        )
+        conditions.extend(filter_conditions)
+        parameters.extend(filter_parameters)
 
         where_sql = " AND ".join(conditions)
         author_list = (
@@ -221,41 +191,7 @@ class DuckDBQueryService:
                 "papers p JOIN search_candidates search_score "
                 "ON search_score.arxiv_id = p.arxiv_id"
             )
-        position_condition = "1 = 1"
-        position_parameters: list[object] = []
-        if after is not None:
-            position_condition = """
-                (
-                    ranked.relevance < ?
-                    OR (
-                        ranked.relevance = ?
-                        AND (
-                            ranked.updated_is_null > ?
-                            OR (
-                                ranked.updated_is_null = ?
-                                AND (
-                                    ranked.updated < ?
-                                    OR (
-                                        ranked.updated IS NOT DISTINCT FROM ?
-                                        AND ranked.arxiv_id > ?
-                                    )
-                                )
-                            )
-                        )
-                    )
-                )
-            """
-            position_parameters.extend(
-                [
-                    after.relevance,
-                    after.relevance,
-                    int(after.updated is None),
-                    int(after.updated is None),
-                    after.updated,
-                    after.updated,
-                    after.arxiv_id,
-                ]
-            )
+        position_condition, position_parameters = _position_filter(after)
 
         sql = f"""
             WITH {search_cte} ranked AS (
@@ -458,6 +394,86 @@ def _validate_limit(limit: int, max_limit: int) -> int:
     if limit < 1 or limit > max_limit:
         raise QueryError(f"limit must be between 1 and {max_limit}")
     return limit
+
+
+def _position_filter(after: SearchPosition | None) -> tuple[str, list[object]]:
+    if after is None:
+        return "1 = 1", []
+    condition = """
+        (
+            ranked.relevance < ?
+            OR (
+                ranked.relevance = ?
+                AND (
+                    ranked.updated_is_null > ?
+                    OR (
+                        ranked.updated_is_null = ?
+                        AND (
+                            ranked.updated < ?
+                            OR (
+                                ranked.updated IS NOT DISTINCT FROM ?
+                                AND ranked.arxiv_id > ?
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    """
+    return condition, [
+        after.relevance,
+        after.relevance,
+        int(after.updated is None),
+        int(after.updated is None),
+        after.updated,
+        after.updated,
+        after.arxiv_id,
+    ]
+
+
+def _structured_filters(
+    *,
+    author: str | None,
+    category: str | None,
+    primary_only: bool,
+    author_name_expression: str,
+    created_from: date | str | None,
+    created_until: date | str | None,
+    updated_from: date | str | None,
+    updated_until: date | str | None,
+) -> tuple[list[str], list[object]]:
+    conditions: list[str] = []
+    parameters: list[object] = []
+    if author:
+        conditions.append(
+            "EXISTS (SELECT 1 FROM paper_authors pa "
+            "JOIN authors a ON a.author_key = pa.author_key "
+            "WHERE pa.arxiv_id = p.arxiv_id "
+            "AND pa.version IS NOT DISTINCT FROM p.version "
+            f"AND {author_name_expression} LIKE ?)"
+        )
+        parameters.append(f"%{_normalize_search_text(author)}%")
+    if category:
+        category_match = "c.category LIKE ?" if category.endswith(".") else "c.category = ?"
+        conditions.append(
+            "EXISTS (SELECT 1 FROM categories c "
+            "WHERE c.arxiv_id = p.arxiv_id "
+            "AND c.version IS NOT DISTINCT FROM p.version "
+            f"AND {category_match}"
+            + (" AND c.is_primary" if primary_only else "")
+            + ")"
+        )
+        parameters.append(f"{category}%" if category.endswith(".") else category)
+    for column, value, operator in (
+        ("created", created_from, ">="),
+        ("created", created_until, "<="),
+        ("updated", updated_from, ">="),
+        ("updated", updated_until, "<="),
+    ):
+        if value is not None:
+            conditions.append(f"p.{column} {operator} ?")
+            parameters.append(_date_value(value))
+    return conditions, parameters
 
 
 def _normalize_search_text(value: str) -> str:

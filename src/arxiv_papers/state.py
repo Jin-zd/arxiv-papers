@@ -66,9 +66,17 @@ class SyncStateStore:
         self, path: Path | str, *, runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME
     ) -> None:
         self.path = Path(path)
+        self.runtime = runtime
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def initialize(self) -> None:
+        """Create or migrate the writable checkpoint schema."""
+
+        self._initialize()
+
+    def _initialize(self) -> None:
         with duckdb.connect(str(self.path)) as connection:
-            runtime.configure(connection, role="query")
+            self.runtime.configure(connection, role="build")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sync_state (
@@ -153,6 +161,7 @@ class SyncStateStore:
         sync_name: str = "full",
         runtime: DuckDBRuntimeConfig = DEFAULT_RUNTIME,
     ) -> SyncCheckpointSession:
+        self.initialize()
         return SyncCheckpointSession(
             self, run_id=run_id, sync_name=sync_name, runtime=runtime
         )
@@ -232,6 +241,7 @@ class SyncStateStore:
         resume: bool,
         initial_datestamp: str | None,
     ) -> SyncContext:
+        self.initialize()
         now = _now()
         with duckdb.connect(str(self.path)) as connection:
             existing_row = connection.execute(
@@ -313,107 +323,6 @@ class SyncStateStore:
             resumed=False,
         )
 
-    def begin_batch(
-        self,
-        *,
-        run_id: str,
-        page_number: int,
-        request_params: dict[str, str],
-    ) -> None:
-        now = _now()
-        with duckdb.connect(str(self.path)) as connection:
-            connection.execute(
-                """
-                INSERT INTO sync_batches (
-                    run_id, page_number, status, request_params_json,
-                    response_sha256, records, parsed_records, parse_errors,
-                    warnings, max_datestamp, next_resumption_token,
-                    started_at, completed_at, error
-                ) VALUES (?, ?, 'started', ?, NULL, 0, 0, 0, 0, NULL,
-                          NULL, ?, NULL, NULL)
-                ON CONFLICT (run_id, page_number) DO UPDATE SET
-                    status = 'started',
-                    request_params_json = excluded.request_params_json,
-                    response_sha256 = NULL,
-                    records = 0,
-                    parsed_records = 0,
-                    parse_errors = 0,
-                    warnings = 0,
-                    max_datestamp = NULL,
-                    next_resumption_token = NULL,
-                    started_at = excluded.started_at,
-                    completed_at = NULL,
-                    error = NULL
-                """,
-                [run_id, page_number, json.dumps(request_params, sort_keys=True), now],
-            )
-
-    def complete_batch(
-        self,
-        *,
-        run_id: str,
-        page_number: int,
-        response_sha256: str,
-        records: int,
-        parsed_records: int,
-        parse_errors: int,
-        warnings: int,
-        max_datestamp: str | None,
-        next_resumption_token: str | None,
-        sync_name: str = "full",
-    ) -> None:
-        now = _now()
-        with duckdb.connect(str(self.path)) as connection:
-            connection.execute("BEGIN TRANSACTION")
-            connection.execute(
-                """
-                UPDATE sync_batches
-                SET status = 'completed', response_sha256 = ?, records = ?,
-                    parsed_records = ?, parse_errors = ?, warnings = ?,
-                    max_datestamp = ?, next_resumption_token = ?,
-                    completed_at = ?, error = NULL
-                WHERE run_id = ? AND page_number = ?
-                """,
-                [
-                    response_sha256,
-                    records,
-                    parsed_records,
-                    parse_errors,
-                    warnings,
-                    max_datestamp,
-                    next_resumption_token,
-                    now,
-                    run_id,
-                    page_number,
-                ],
-            )
-            connection.execute(
-                """
-                UPDATE sync_state
-                SET updated_at = ?, next_resumption_token = ?,
-                    last_successful_page = ?,
-                    last_successful_datestamp = CASE
-                        WHEN last_successful_datestamp IS NULL THEN ?
-                        WHEN ? IS NULL THEN last_successful_datestamp
-                        WHEN ? > last_successful_datestamp THEN ?
-                        ELSE last_successful_datestamp
-                    END,
-                    error = NULL
-                WHERE sync_name = ? AND run_id = ?
-                """,
-                [
-                    now,
-                    next_resumption_token,
-                    page_number,
-                    max_datestamp,
-                    max_datestamp,
-                    max_datestamp,
-                    max_datestamp,
-                    sync_name,
-                    run_id,
-                ],
-            )
-            connection.execute("COMMIT")
 
     def mark_token_invalid(
         self, *, run_id: str, error: str, sync_name: str = "full"
@@ -493,6 +402,8 @@ class SyncStateStore:
             )
 
     def get_state(self, sync_name: str = "full") -> SyncState | None:
+        if not self.path.is_file():
+            return None
         with duckdb.connect(str(self.path), read_only=True) as connection:
             row = connection.execute(
                 f"SELECT {_STATE_COLUMNS} FROM sync_state WHERE sync_name = ?",
@@ -501,6 +412,8 @@ class SyncStateStore:
         return _state_from_row(row) if row else None
 
     def latest_completed(self) -> SyncState | None:
+        if not self.path.is_file():
+            return None
         with duckdb.connect(str(self.path), read_only=True) as connection:
             row = connection.execute(
                 f"""
@@ -514,6 +427,14 @@ class SyncStateStore:
         return _state_from_row(row) if row else None
 
     def status(self, sync_name: str | None = None) -> dict[str, object]:
+        if not self.path.is_file():
+            return {
+                "state_path": str(self.path),
+                "state": None,
+                "states": [],
+                "batches": [],
+                "dead_letters": 0,
+            }
         with duckdb.connect(str(self.path), read_only=True) as connection:
             state_rows = connection.execute(
                 f"SELECT {_STATE_COLUMNS} FROM sync_state ORDER BY sync_name"

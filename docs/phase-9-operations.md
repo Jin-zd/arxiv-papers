@@ -17,7 +17,8 @@ MCP 查询连接默认使用 2 个 DuckDB worker、最多 8 个连接，每连�
 - `ARXIV_SYNC_CHECKPOINT_PAGES` / `ARXIV_SYNC_CHECKPOINT_RECORDS`
 
 查询快照必须包含 DuckDB FTS 扩展。构建快照时会自动加载或安装匹配版本的
-扩展；安装失败会终止构建，不再静默降级到 `ILIKE` 全表搜索。
+扩展；安装失败会终止构建，不再静默降级到 `ILIKE` 全表搜索。查询进程只加载
+扩展，不会在请求期间安装扩展或访问网络。
 
 ## 结构化日志与指标
 

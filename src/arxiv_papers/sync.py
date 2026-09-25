@@ -158,36 +158,36 @@ class FullSyncRunner:
             created_until=_date_string(scope.created_until),
             category_prefixes=scope.category_prefixes,
         )
+        return self._execute_run(context, scope=scope, base_snapshot=None)
+
+    def _execute_run(
+        self,
+        context: SyncContext,
+        *,
+        scope: PaperScope,
+        base_snapshot: Path | None,
+    ) -> FullSyncResult:
         stats = SyncStats(run_id=context.run_id)
         started_at = time.monotonic()
-        parquet_root = self.data_dir / "parquet" / "full" / context.run_id
+        parquet_root = self.data_dir / "parquet" / context.sync_name / context.run_id
         store = ParquetBatchStore(parquet_root)
         run_date = datetime.now(UTC).date()
-
+        if self.progress is not None:
+            self.progress.start()
         LOGGER.info(
-            "full_sync_started",
+            "sync_started",
             extra={
                 "run_id": context.run_id,
+                "mode": context.sync_name,
                 "resumed": context.resumed,
                 "from": context.from_date,
                 "until": context.until_date,
-                "set": context.set_name,
-                "metadata_prefix": context.metadata_prefix,
-                "created_from": context.created_from,
-                "created_until": context.created_until,
-                "category_prefixes": context.category_prefixes,
                 "next_page": context.next_page,
             },
         )
-        if self.progress is not None:
-            self.progress.start()
         next_page = context.next_page
         try:
-            should_fetch = (
-                not context.has_checkpointed_pages
-                or context.next_resumption_token is not None
-            )
-            if should_fetch:
+            if not context.has_checkpointed_pages or context.next_resumption_token:
                 try:
                     next_page = self._consume_pages(
                         client_pages=self.client.list_records(
@@ -203,11 +203,12 @@ class FullSyncRunner:
                         store=store,
                         stats=stats,
                         scope=scope,
+                        sync_name=context.sync_name,
                     )
                 except OAIProtocolError as error:
                     if error.code != "badResumptionToken":
                         raise
-                    current = self.state_store.get_state()
+                    current = self.state_store.get_state(context.sync_name)
                     if current is None:
                         raise
                     recovery_from = overlap_datestamp(
@@ -216,53 +217,51 @@ class FullSyncRunner:
                         overlap_days=self.overlap_days,
                     )
                     self.state_store.mark_token_invalid(
-                        run_id=context.run_id, error=str(error)
+                        run_id=context.run_id,
+                        error=str(error),
+                        sync_name=context.sync_name,
                     )
                     stats.token_recoveries += 1
-                    recovered = self.state_store.get_state()
-                    if recovered is None:
-                        raise
                     LOGGER.warning(
                         "oai_resumption_token_invalid",
-                        extra={
-                            "run_id": context.run_id,
-                            "recovery_from": recovery_from,
-                            "last_successful_page": recovered.last_successful_page,
-                        },
+                        extra={"run_id": context.run_id, "recovery_from": recovery_from},
                     )
                     next_page = self._consume_pages(
                         client_pages=self.client.list_records(
                             from_=recovery_from,
-                            until=recovered.until_date,
-                            set_name=recovered.set_name,
-                            metadata_prefix=recovered.metadata_prefix,
+                            until=current.until_date,
+                            set_name=current.set_name,
+                            metadata_prefix=current.metadata_prefix,
                         ),
-                        start_page=recovered.last_successful_page + 1,
+                        start_page=current.last_successful_page + 1,
                         run_id=context.run_id,
                         run_date=run_date,
                         store=store,
                         stats=stats,
                         scope=scope,
+                        sync_name=context.sync_name,
                     )
 
             result = self._complete_run(
                 context=context,
                 parquet_root=parquet_root,
                 store=store,
-                base_snapshot=None,
+                base_snapshot=base_snapshot,
                 stats=stats,
                 started_at=started_at,
-                sync_name="full",
+                sync_name=context.sync_name,
             )
             if self.progress is not None:
                 self.progress.finish(success=True)
-            LOGGER.info("full_sync_finished", extra=result.as_dict())
+            LOGGER.info("sync_finished", extra=result.as_dict())
             return result
         except Exception as error:
             stats.update_client_metrics(self.client, started_at)
             if self.progress is not None:
                 self.progress.finish(success=False)
-            self.state_store.mark_failed(run_id=context.run_id, error=str(error))
+            self.state_store.mark_failed(
+                run_id=context.run_id, error=str(error), sync_name=context.sync_name
+            )
             if not isinstance(error, MetadataParseError):
                 self.state_store.record_dead_letter(
                     run_id=context.run_id,
@@ -271,7 +270,7 @@ class FullSyncRunner:
                     error_type=type(error).__name__,
                     error=str(error),
                 )
-            LOGGER.exception("full_sync_failed", extra={"run_id": context.run_id})
+            LOGGER.exception("sync_failed", extra={"run_id": context.run_id})
             raise
 
     def _consume_pages(
@@ -320,74 +319,81 @@ class FullSyncRunner:
         with self.state_store.checkpoint_session(
             run_id=run_id, sync_name=sync_name, runtime=self.runtime
         ) as checkpoint:
-            while True:
-                if self.progress is not None:
-                    self.progress.requesting(page_number=page_number)
-                try:
-                    page = next(page_iterator)
-                except StopIteration:
-                    break
-                stats.pages += 1
-                stats.records += len(page.records)
-                request_params = dict(page.request_params)
-                checkpoint.begin_page(
-                    page_number=page_number, request_params=request_params
-                )
-                archive_entry = self.archive.save_response(
-                    run_id=run_id,
-                    page_number=page_number,
-                    raw_xml=page.raw_xml,
-                    request_params=request_params,
-                    run_date=run_date,
-                    http_status=page.http_status,
-                    elapsed_seconds=page.elapsed_seconds,
-                )
-                parse_errors_before = stats.parse_errors
-                parsed_records = self._parse_page_records(
-                    page=page,
-                    page_number=page_number,
-                    run_id=run_id,
-                    store=store,
-                    archive_entry=archive_entry,
-                    stats=stats,
-                    scope=scope,
-                    checkpoint=checkpoint,
-                )
-                batch_records.extend(parsed_records)
-                page_parse_errors = stats.parse_errors - parse_errors_before
-                batch_pages.append(
-                    {
-                        "page_number": page_number,
-                        "response_sha256": archive_entry.sha256,
-                        "records": len(page.records),
-                        "parsed_records": len(parsed_records),
-                        "parse_errors": page_parse_errors,
-                        "warnings": sum(len(record.warnings) for record in parsed_records),
-                        "max_datestamp": _max_datestamp(page),
-                        "next_resumption_token": page.resumption_token,
-                    }
-                )
-                batch_records_count += len(parsed_records)
-                batch_bytes += len(page.raw_xml)
-                LOGGER.info(
-                    "full_sync_page_staged",
-                    extra={
-                        "run_id": run_id,
-                        "page_number": page_number,
-                        "records": len(page.records),
-                        "parsed_records": len(parsed_records),
-                    },
-                )
-                if self.progress is not None:
-                    self.progress.update(page, page_number=page_number)
-                page_number += 1
-                if (
-                    len(batch_pages) >= self.runtime.checkpoint_pages
-                    or batch_records_count >= self.runtime.checkpoint_records
-                    or batch_bytes >= self.runtime.checkpoint_bytes
-                ):
-                    flush_batch()
-            flush_batch()
+            try:
+                while True:
+                    if self.progress is not None:
+                        self.progress.requesting(page_number=page_number)
+                    try:
+                        page = next(page_iterator)
+                    except StopIteration:
+                        break
+                    stats.pages += 1
+                    stats.records += len(page.records)
+                    request_params = dict(page.request_params)
+                    checkpoint.begin_page(
+                        page_number=page_number, request_params=request_params
+                    )
+                    archive_entry = self.archive.save_response(
+                        run_id=run_id,
+                        page_number=page_number,
+                        raw_xml=page.raw_xml,
+                        request_params=request_params,
+                        run_date=run_date,
+                        http_status=page.http_status,
+                        elapsed_seconds=page.elapsed_seconds,
+                    )
+                    parse_errors_before = stats.parse_errors
+                    parsed_records = self._parse_page_records(
+                        page=page,
+                        page_number=page_number,
+                        store=store,
+                        archive_entry=archive_entry,
+                        stats=stats,
+                        scope=scope,
+                        checkpoint=checkpoint,
+                    )
+                    batch_records.extend(parsed_records)
+                    page_parse_errors = stats.parse_errors - parse_errors_before
+                    batch_pages.append(
+                        {
+                            "page_number": page_number,
+                            "response_sha256": archive_entry.sha256,
+                            "records": len(page.records),
+                            "parsed_records": len(parsed_records),
+                            "parse_errors": page_parse_errors,
+                            "warnings": sum(
+                                len(record.warnings) for record in parsed_records
+                            ),
+                            "max_datestamp": _max_datestamp(page),
+                            "next_resumption_token": page.resumption_token,
+                        }
+                    )
+                    batch_records_count += len(parsed_records)
+                    batch_bytes += len(page.raw_xml)
+                    LOGGER.info(
+                        "full_sync_page_staged",
+                        extra={
+                            "run_id": run_id,
+                            "page_number": page_number,
+                            "records": len(page.records),
+                            "parsed_records": len(parsed_records),
+                        },
+                    )
+                    if self.progress is not None:
+                        self.progress.update(page, page_number=page_number)
+                    page_number += 1
+                    if (
+                        len(batch_pages) >= self.runtime.checkpoint_pages
+                        or batch_records_count >= self.runtime.checkpoint_records
+                        or batch_bytes >= self.runtime.checkpoint_bytes
+                    ):
+                        flush_batch()
+                flush_batch()
+            except BaseException:
+                # Make every fully processed page durable before propagating a
+                # transport, parse, or archive failure from the next page.
+                flush_batch()
+                raise
         return page_number
 
     def _complete_run(
@@ -461,12 +467,11 @@ class FullSyncRunner:
         *,
         page: OAIPage,
         page_number: int,
-        run_id: str,
         store: ParquetBatchStore,
         archive_entry: RawArchiveEntry,
         stats: SyncStats,
         scope: PaperScope,
-        checkpoint: SyncCheckpointSession | None = None,
+        checkpoint: SyncCheckpointSession,
     ) -> list[ParsedArxivRecord]:
         parsed_records: list[ParsedArxivRecord] = []
         for record in page.records:
@@ -479,27 +484,17 @@ class FullSyncRunner:
                     oai_identifier=record.identifier,
                     error=error,
                 )
-                if checkpoint is not None:
-                    checkpoint.record_dead_letter(
-                        page_number=page_number,
-                        oai_identifier=record.identifier,
-                        error_type=type(error).__name__,
-                        error=str(error),
-                        raw_xml_path=archive_entry.xml_path,
-                    )
-                else:
-                    self.state_store.record_dead_letter(
-                        run_id=run_id,
-                        page_number=page_number,
-                        oai_identifier=record.identifier,
-                        error_type=type(error).__name__,
-                        error=str(error),
-                        raw_xml_path=archive_entry.xml_path,
-                    )
+                checkpoint.record_dead_letter(
+                    page_number=page_number,
+                    oai_identifier=record.identifier,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                    raw_xml_path=archive_entry.xml_path,
+                )
                 LOGGER.error(
                     "metadata_record_parse_failed",
                     extra={
-                        "run_id": run_id,
+                        "run_id": checkpoint.run_id,
                         "page_number": page_number,
                         "oai_identifier": record.identifier,
                         "error": str(error),
@@ -609,100 +604,7 @@ class IncrementalSyncRunner(FullSyncRunner):
             category_prefixes=scope.category_prefixes,
             initial_datestamp=base_state.last_successful_datestamp,
         )
-        stats = SyncStats(run_id=context.run_id)
-        started_at = time.monotonic()
-        parquet_root = self.data_dir / "parquet" / "incremental" / context.run_id
-        store = ParquetBatchStore(parquet_root)
-        run_date = datetime.now(UTC).date()
-        if self.progress is not None:
-            self.progress.start()
-        next_page = context.next_page
-        try:
-            should_fetch = (
-                not context.has_checkpointed_pages
-                or context.next_resumption_token is not None
-            )
-            if should_fetch:
-                try:
-                    next_page = self._consume_pages(
-                        client_pages=self.client.list_records(
-                            from_=context.from_date,
-                            until=context.until_date,
-                            set_name=context.set_name,
-                            metadata_prefix=context.metadata_prefix,
-                            resumption_token=context.next_resumption_token,
-                        ),
-                        start_page=next_page,
-                        run_id=context.run_id,
-                        run_date=run_date,
-                        store=store,
-                        stats=stats,
-                        scope=scope,
-                        sync_name="incremental",
-                    )
-                except OAIProtocolError as error:
-                    if error.code != "badResumptionToken":
-                        raise
-                    current = self.state_store.get_state("incremental")
-                    if current is None:
-                        raise
-                    recovery_from = overlap_datestamp(
-                        current.last_successful_datestamp,
-                        current.from_date,
-                        overlap_days=self.overlap_days,
-                    )
-                    self.state_store.mark_token_invalid(
-                        run_id=context.run_id,
-                        error=str(error),
-                        sync_name="incremental",
-                    )
-                    stats.token_recoveries += 1
-                    recovered = self.state_store.get_state("incremental")
-                    if recovered is None:
-                        raise
-                    next_page = self._consume_pages(
-                        client_pages=self.client.list_records(
-                            from_=recovery_from,
-                            until=recovered.until_date,
-                            set_name=recovered.set_name,
-                            metadata_prefix=recovered.metadata_prefix,
-                        ),
-                        start_page=recovered.last_successful_page + 1,
-                        run_id=context.run_id,
-                        run_date=run_date,
-                        store=store,
-                        stats=stats,
-                        scope=scope,
-                        sync_name="incremental",
-                    )
-
-            result = self._complete_run(
-                context=context,
-                parquet_root=parquet_root,
-                store=store,
-                base_snapshot=base_snapshot,
-                stats=stats,
-                started_at=started_at,
-                sync_name="incremental",
-            )
-            if self.progress is not None:
-                self.progress.finish(success=True)
-            return result
-        except Exception as error:
-            stats.update_client_metrics(self.client, started_at)
-            if self.progress is not None:
-                self.progress.finish(success=False)
-            self.state_store.mark_failed(
-                run_id=context.run_id, error=str(error), sync_name="incremental"
-            )
-            self.state_store.record_dead_letter(
-                run_id=context.run_id,
-                page_number=next_page,
-                oai_identifier=None,
-                error_type=type(error).__name__,
-                error=str(error),
-            )
-            raise
+        return self._execute_run(context, scope=scope, base_snapshot=base_snapshot)
 
 
 def _new_run_id(prefix: str = "full") -> str:

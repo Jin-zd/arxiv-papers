@@ -49,7 +49,11 @@ class ProgressDisplay:
         self.current_page_bytes += count
         self._saw_stream_bytes = True
         now = time.monotonic()
-        if now - self._last_render_at < 0.1 and self.current_page_bytes < 1024 * 1024:
+        if (
+            self.current_page_bytes != count
+            and now - self._last_render_at < 0.1
+            and self.current_page_bytes < 1024 * 1024
+        ):
             return
         elapsed = max(time.monotonic() - self.started_at, 0.001)
         speed = self.downloaded_bytes / elapsed
