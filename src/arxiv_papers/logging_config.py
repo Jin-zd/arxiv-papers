@@ -37,9 +37,15 @@ def configure_logging(
     *,
     log_file: Path | str | None = None,
     level: int = logging.INFO,
+    stream_level: int = logging.WARNING,
     stream: Any = None,
 ) -> logging.Logger:
-    """Configure the application logger without changing third-party handlers."""
+    """Configure file logging and concise terminal logging.
+
+    Synchronization progress is rendered separately by ``tqdm``.  Keep the
+    terminal handler at warning level so routine per-page INFO events do not
+    overwrite the progress bar, while a log file still receives all events.
+    """
 
     root = logging.getLogger("arxiv_papers")
     root.setLevel(level)
@@ -50,12 +56,14 @@ def configure_logging(
     formatter = JsonFormatter()
     output_stream = stream if stream is not None else sys.stderr
     stream_handler = logging.StreamHandler(output_stream)
+    stream_handler.setLevel(stream_level)
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
     if log_file is not None:
         path = Path(log_file)
         path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
     return root

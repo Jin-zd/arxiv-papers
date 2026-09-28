@@ -77,8 +77,6 @@ def full_sync(
         request_delay=request_delay,
     )
     progress_display = ProgressDisplay() if progress else None
-    if progress_display is not None:
-        progress_display.start()
     with OAIClient(
         config,
         on_bytes_received=(
@@ -283,8 +281,6 @@ def incremental_sync(
         request_delay=request_delay,
     )
     progress_display = ProgressDisplay() if progress else None
-    if progress_display is not None:
-        progress_display.start()
     with OAIClient(
         config,
         on_bytes_received=(
