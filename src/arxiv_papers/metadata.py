@@ -37,6 +37,7 @@ class ArxivAuthor(BaseModel):
     suffix: str | None = None
     affiliations: tuple[str, ...] = ()
     display_name: str
+    name_source: str = "structured"
 
 
 class ArxivCategory(BaseModel):
@@ -118,6 +119,7 @@ class ParsedArxivRecord(BaseModel):
     oai_identifier: str
     oai_datestamp: str | None
     deleted: bool = False
+    excluded: bool = False
     metadata: ArxivPaperMetadata | None = None
     metadata_hash: str | None = None
     warnings: tuple[str, ...] = ()
@@ -332,8 +334,8 @@ def _parse_dates(
 
 def _parse_raw_authors(value: str) -> list[ArxivAuthor]:
     return [
-        ArxivAuthor(display_name=name.strip())
-        for name in re.split(r"\s+and\s+", value)
+        ArxivAuthor(display_name=name.strip(), name_source="raw_heuristic")
+        for name in re.split(r"\s*,\s*|\s+and\s+", value)
         if name.strip()
     ]
 

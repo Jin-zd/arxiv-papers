@@ -35,6 +35,7 @@ class SyncState:
     completed_at: str | None
     snapshot_path: str | None
     error: str | None
+    last_scanned_until: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +100,8 @@ class SyncStateStore:
                     updated_at VARCHAR NOT NULL,
                     completed_at VARCHAR,
                     snapshot_path VARCHAR,
-                    error VARCHAR
+                    error VARCHAR,
+                    last_scanned_until VARCHAR
                 )
                 """
             )
@@ -109,10 +111,16 @@ class SyncStateStore:
                 ("created_from", "VARCHAR"),
                 ("created_until", "VARCHAR"),
                 ("category_prefixes", "VARCHAR"),
+                ("last_scanned_until", "VARCHAR"),
             ):
                 connection.execute(
                     f"ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS {column} {definition}"
                 )
+            connection.execute(
+                "UPDATE sync_state SET last_scanned_until = until_date "
+                "WHERE status = 'completed' AND last_scanned_until IS NULL "
+                "AND until_date IS NOT NULL"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sync_batches (
@@ -286,9 +294,10 @@ class SyncStateStore:
                     set_name, metadata_prefix, created_from, created_until,
                     category_prefixes, next_resumption_token, last_successful_page,
                     last_successful_datestamp, recovery_count, started_at,
-                    updated_at, completed_at, snapshot_path, error
+                    updated_at, completed_at, snapshot_path, error,
+                    last_scanned_until
                 ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, NULL, 0,
-                          ?, 0, ?, ?, NULL, NULL, NULL)
+                          ?, 0, ?, ?, NULL, NULL, NULL, NULL)
                 """,
                 [
                     sync_name,
@@ -348,7 +357,8 @@ class SyncStateStore:
                 """
                 UPDATE sync_state
                 SET status = 'completed', completed_at = ?, updated_at = ?,
-                    snapshot_path = ?, error = NULL
+                    snapshot_path = ?, error = NULL,
+                    last_scanned_until = until_date
                 WHERE sync_name = ? AND run_id = ?
                 """,
                 [now, now, str(snapshot_path), sync_name, run_id],
@@ -406,7 +416,7 @@ class SyncStateStore:
             return None
         with duckdb.connect(str(self.path), read_only=True) as connection:
             row = connection.execute(
-                f"SELECT {_STATE_COLUMNS} FROM sync_state WHERE sync_name = ?",
+                f"SELECT {_state_columns(connection)} FROM sync_state WHERE sync_name = ?",
                 [sync_name],
             ).fetchone()
         return _state_from_row(row) if row else None
@@ -417,7 +427,7 @@ class SyncStateStore:
         with duckdb.connect(str(self.path), read_only=True) as connection:
             row = connection.execute(
                 f"""
-                SELECT {_STATE_COLUMNS}
+                SELECT {_state_columns(connection)}
                 FROM sync_state
                 WHERE status = 'completed' AND snapshot_path IS NOT NULL
                 ORDER BY completed_at DESC NULLS LAST
@@ -425,6 +435,16 @@ class SyncStateStore:
                 """
             ).fetchone()
         return _state_from_row(row) if row else None
+
+    def completed_snapshot_paths(self) -> tuple[Path, ...]:
+        if not self.path.is_file():
+            return ()
+        with duckdb.connect(str(self.path), read_only=True) as connection:
+            rows = connection.execute(
+                "SELECT snapshot_path FROM sync_state "
+                "WHERE status = 'completed' AND snapshot_path IS NOT NULL"
+            ).fetchall()
+        return tuple(Path(str(row[0])) for row in rows)
 
     def status(self, sync_name: str | None = None) -> dict[str, object]:
         if not self.path.is_file():
@@ -437,7 +457,7 @@ class SyncStateStore:
             }
         with duckdb.connect(str(self.path), read_only=True) as connection:
             state_rows = connection.execute(
-                f"SELECT {_STATE_COLUMNS} FROM sync_state ORDER BY sync_name"
+                f"SELECT {_state_columns(connection)} FROM sync_state ORDER BY sync_name"
             ).fetchall()
             batch_rows = connection.execute(
                 """
@@ -696,6 +716,7 @@ def _state_from_row(row: tuple[object, ...] | None) -> SyncState | None:
         completed_at=_optional_string(row[17]),
         snapshot_path=_optional_string(row[18]),
         error=_optional_string(row[19]),
+        last_scanned_until=_optional_string(row[20]),
     )
 
 
@@ -723,6 +744,7 @@ def _state_to_dict(state: SyncState | None) -> dict[str, object] | None:
         "completed_at": state.completed_at,
         "snapshot_path": state.snapshot_path,
         "error": state.error,
+        "last_scanned_until": state.last_scanned_until,
     }
 
 
@@ -807,8 +829,19 @@ _STATE_COLUMNS = (
     "sync_name, run_id, mode, status, from_date, until_date, set_name, "
     "metadata_prefix, created_from, created_until, category_prefixes, "
     "next_resumption_token, last_successful_page, last_successful_datestamp, "
-    "recovery_count, started_at, updated_at, completed_at, snapshot_path, error"
+    "recovery_count, started_at, updated_at, completed_at, snapshot_path, error, "
+    "last_scanned_until"
 )
+
+
+def _state_columns(connection: duckdb.DuckDBPyConnection) -> str:
+    existing = connection.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'sync_state' AND column_name = 'last_scanned_until'"
+    ).fetchone()
+    if existing:
+        return _STATE_COLUMNS
+    return _STATE_COLUMNS.replace("last_scanned_until", "NULL AS last_scanned_until")
 
 
 __all__ = [

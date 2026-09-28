@@ -32,14 +32,14 @@ with DuckDBQueryService("data-cs-2023/duckdb/library-<run-id>.duckdb") as query:
 
 ## 索引和全文检索
 
-快照构建会建立以下结构化索引：arXiv ID、DOI、创建日期、更新时间、作者 key、标准化作者名、论文-作者关联、分类和论文-分类关联。
+快照构建为 arXiv ID、规范化 DOI、作者 key、论文-作者关联、分类和论文-分类关联建立索引。作者名包含搜索使用子串匹配，不依赖 B-tree 名称索引。
 
-全文检索数据集中在 `paper_search` 表，字段为 `title`、`abstract`、`comments` 和 `journal_ref` 的拼接内容。构建快照时会加载或安装 `fts` 扩展，创建 `fts_main_paper_search` BM25 索引，并使用 Porter 词干化、英文停用词、大小写归一化和 accent stripping。
+全文检索直接在 `papers` 的 `title`、`abstract`、`comments` 和 `journal_ref` 字段上建立 `fts_main_papers` BM25 索引，不再保存第二份 `paper_search` 文本表。构建快照时会加载或安装 `fts` 扩展，并使用 Porter 词干化、英文停用词、大小写归一化和 accent stripping。
 
 FTS 扩展只在构建快照时加载或安装，构建失败会终止并保留旧快照。查询层只加载快照声明的扩展，不会在 MCP 请求期间安装扩展或访问网络；扩展缺失时返回明确错误。
 
 ## 快照 schema
 
-当前查询快照使用 schema `5`，并要求包含物化的 `paper_details` 表。`get_paper` 和批量详情查询只使用该表的一次详情查询路径，不再读取旧 schema 的兼容查询路径。
+当前查询快照使用 schema `6`，并要求包含物化的 `paper_details` 与 `excluded_records` 表。`get_paper` 和批量详情查询使用一次详情查询路径。schema `4/5` 快照仍可只读查询，但不能作为新版增量同步的基线。
 
-已有 schema `2/3/4` 快照不能直接提供查询服务，但仍可作为增量同步基线；下一次 incremental sync 会重建为 schema `5`。完成重建并发布新快照后，MCP 才会使用该 generation。
+要使用 schema `6` 的范围退出和作者语义，需要在新数据目录重新完整同步。

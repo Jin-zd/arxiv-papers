@@ -294,7 +294,7 @@ def scheduler_plan(
 def _snapshot_counts(path: Path) -> dict[str, int]:
     try:
         with duckdb.connect(str(path), read_only=True) as connection:
-            return {
+            counts = {
                 table: _count_table(connection, table)
                 for table in (
                     "papers",
@@ -304,6 +304,13 @@ def _snapshot_counts(path: Path) -> dict[str, int]:
                     "deleted_records",
                 )
             }
+            has_excluded = connection.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = 'main' AND table_name = 'excluded_records'"
+            ).fetchone()
+            if has_excluded and has_excluded[0]:
+                counts["excluded_records"] = _count_table(connection, "excluded_records")
+            return counts
     except duckdb.Error as error:
         raise SnapshotCatalogError(f"cannot read snapshot counts: {path}") from error
 

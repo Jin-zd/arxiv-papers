@@ -70,6 +70,36 @@ uv run arxiv-papers ops schedule \
 任务失败时同步状态会保留为 `failed`，下一次相同 scope 的运行会按 checkpoint 恢复。
 可由外部监控定期检查 `ops health` 的退出输出和 JSON 中的 `ok`、`issues` 字段。
 
+## 历史数据修复
+
+旧版本曾在单条记录解析失败后继续提交页面，也曾把同一论文版本的新旧作者、分类
+关联一起保留。升级后的同步会阻止新的缺失和旧关联继续累积，但不会自动修复已经
+发布的快照。最稳妥的方式是在新目录重新完整同步：
+
+```bash
+uv run arxiv-papers sync full --data-dir data-cs-2023-rebuilt --no-progress
+uv run arxiv-papers sync verify --data-dir data-cs-2023-rebuilt --sync-name full
+uv run arxiv-papers ops health --data-dir data-cs-2023-rebuilt --sync-name full
+```
+
+命令沿用默认的 `cs` OAI set、`arXivRaw` 元数据和 2023-01-01 起的本地创建日期
+过滤。确认新目录的 `verify` 和 `health` 均为 `ok: true` 后，把 MCP 服务及每日增量
+同步的 `--data-dir` 改为 `data-cs-2023-rebuilt`。旧目录保留作核对，不要在同步中
+切换目录。
+
+新版快照 schema 为 `6`。旧快照仍可只读查询，但新版增量同步会拒绝旧 schema
+基线；不要直接对旧数据目录运行增量命令。新目录完成全量同步后，增量默认扫描
+全局 OAI 变更并应用本地 `cs.` 分类过滤，下载量会高于旧的 `set=cs` 增量扫描。
+
+若只修复少量已知论文，解析失败的 ID 和 `raw_xml_path` 可从
+`state/sync.duckdb` 的 `dead_letters` 表取得；旧关联污染则需要先确定受影响的
+论文 ID。用 `RawXMLArchive.read_response()` 解压归档页，再通过
+`OAIClient._parse_page()` 和 `parse_oai_record()` 解析。必须选出该论文最新的 OAI
+记录，重新生成其 Parquet 关系行，用 `DuckDBSnapshotBuilder` 基于当前快照构建新
+快照，并在验证后更新快照指针和同步状态。当前 CLI 没有归档重放命令；只手工改
+DuckDB 的作者或分类表会遗漏 `paper_details` 和搜索索引，因此不建议直接修改现有
+快照。
+
 ## 备份
 
 备份使用临时目录构建，完成后原子重命名；默认包含 `parquet`、`duckdb` 和 `state`，

@@ -731,6 +731,12 @@ def resolve_snapshot_path(
         state_snapshot = _snapshot_from_state(state_path, sync_name)
         if state_snapshot is not None and state_snapshot.is_file():
             return state_snapshot
+        if sync_name is not None:
+            raise SnapshotResolutionError(
+                f"no completed snapshot exists for sync state {sync_name!r}"
+            )
+    elif sync_name is not None:
+        raise SnapshotResolutionError(f"sync state database does not exist: {state_path}")
 
     duckdb_dir = data_path / "duckdb"
     candidates = tuple(duckdb_dir.glob("library-*.duckdb"))

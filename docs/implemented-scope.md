@@ -32,6 +32,10 @@ category。`set=cs` 用于缩小 OAI-PMH 数据源范围，最终范围仍由本
 历史版本独立的标题、摘要、作者和分类，历史版本行不会复制当前字段或伪造旧版本
 metadata；这些字段只在 `is_current = true` 的当前版本行提供。
 
+`arXivRaw` 的作者字段是原始字符串。`authors_raw` 保留原文；逗号和 `and`
+拆出的作者行仅用于检索和展示，`name_source=raw_heuristic` 表示拆分可能有歧义。
+结构化作者则标记为 `structured`。`report_numbers` 保存源记录中的报告编号。
+
 ## 存储语义
 
 ```text
@@ -43,7 +47,10 @@ data/state/sync.duckdb
 ```
 
 `papers` 是去重、软删除后的当前论文视图；`paper_versions` 保留所有版本历史。
-增量同步会继承最近一次完成同步的 metadata prefix、set、创建时间范围和分类范围，
+`excluded_records` 记录已经进入本地库、后来不再满足本地范围的论文。每日增量默认
+扫描不带 OAI set 的变更流，才能观察退出 `cs` set 的论文；全量同步仍默认使用
+`set=cs`。显式为增量指定 `--set` 会缩小观察范围，可能漏掉退出该 set 的更新。
+增量同步会继承最近一次完成同步的 metadata prefix、创建时间范围和分类范围，
 并将这些参数写入 checkpoint，避免恢复时混用不同 scope。
 
 `duckdb/current.json` 是已完成查询校验的当前快照指针，由临时文件加原子替换发布。

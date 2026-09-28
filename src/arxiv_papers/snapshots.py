@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,8 +29,8 @@ _BASE_SNAPSHOT_TABLES = (
     "deleted_records",
     "library_metadata",
 )
-_SEARCH_SNAPSHOT_TABLES = ("paper_search", "search_metadata")
-_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"4", "5"})
+_SEARCH_SNAPSHOT_TABLES = ("search_metadata",)
+_SUPPORTED_SNAPSHOT_SCHEMAS = frozenset({"4", "5", "6"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,12 +143,13 @@ class SnapshotCatalog:
         self._atomic_write_json(payload)
         return pointer
 
-    def prune(self) -> tuple[Path, ...]:
+    def prune(
+        self, *, protected_paths: Iterable[Path | str] = ()
+    ) -> tuple[Path, ...]:
         """Remove snapshots older than the configured retention window.
 
-        The currently published snapshot is always protected. A deletion failure is
-        ignored so retention maintenance cannot make a valid published snapshot
-        unavailable.
+        The current pointer and caller-supplied state references are protected.
+        Deletion failures are ignored so cleanup cannot disrupt publication.
         """
 
         candidates = sorted(
@@ -158,6 +159,7 @@ class SnapshotCatalog:
         )
         current = self.current_snapshot()
         keep = set(candidates[: self.retention])
+        keep.update(Path(path) for path in protected_paths)
         if current is not None:
             keep.add(current)
         removed: list[Path] = []
@@ -201,6 +203,14 @@ class SnapshotCatalog:
                 if schema_version not in _SUPPORTED_SNAPSHOT_SCHEMAS:
                     raise SnapshotCatalogError(
                         f"snapshot uses unsupported schema version: {schema_version}"
+                    )
+                if schema_version == "6" and "excluded_records" not in available:
+                    raise SnapshotCatalogError(
+                        "snapshot is missing required table: excluded_records"
+                    )
+                if schema_version in {"4", "5"} and "paper_search" not in available:
+                    raise SnapshotCatalogError(
+                        "snapshot is missing required table: paper_search"
                     )
                 missing_search = [
                     table

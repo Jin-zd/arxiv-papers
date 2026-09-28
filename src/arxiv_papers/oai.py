@@ -434,9 +434,25 @@ class OAIClient:
         except (etree.XMLSyntaxError, ValueError) as exc:
             raise OAIParseError(f"invalid OAI-PMH XML: {exc}") from exc
 
-        errors = [element for element in root.iter() if _local_name(element) == "error"]
+        errors = [element for element in root if _local_name(element) == "error"]
         if errors:
             error = errors[0]
+            if (
+                error.get("code") == "noRecordsMatch"
+                and request_params is not None
+                and "resumptionToken" not in request_params
+                and request_params.get("verb") == "ListRecords"
+            ):
+                return OAIPage(
+                    raw_xml=raw_xml,
+                    records=(),
+                    resumption_token=None,
+                    cursor=None,
+                    complete_list_size=0,
+                    request_params=tuple(request_params.items()),
+                    http_status=http_status,
+                    elapsed_seconds=elapsed_seconds,
+                )
             raise OAIProtocolError(
                 error.get("code", "unknown"),
                 _text(error) or "the OAI-PMH endpoint returned an error",

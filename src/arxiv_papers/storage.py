@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from arxiv_papers.metadata import (
+    ArxivAuthor,
     ArxivPaperMetadata,
     ParsedArxivRecord,
     normalize_arxiv_id,
@@ -45,6 +46,7 @@ PAPER_VERSION_SCHEMA = pa.schema(
         pa.field("license", pa.string()),
         pa.field("primary_category", pa.string()),
         pa.field("authors_raw", pa.string()),
+        pa.field("report_numbers", pa.list_(pa.string())),
         pa.field("oai_identifier", pa.string(), nullable=False),
         pa.field("oai_datestamp", pa.string()),
         pa.field("metadata_hash", pa.string()),
@@ -58,6 +60,7 @@ AUTHOR_SCHEMA = pa.schema(
         pa.field("suffix", pa.string()),
         pa.field("display_name", pa.string(), nullable=False),
         pa.field("affiliations_json", pa.string(), nullable=False),
+        pa.field("name_source", pa.string(), nullable=False),
     ]
 )
 PAPER_AUTHOR_SCHEMA = pa.schema(
@@ -66,6 +69,8 @@ PAPER_AUTHOR_SCHEMA = pa.schema(
         pa.field("version", pa.int64()),
         pa.field("author_key", pa.string(), nullable=False),
         pa.field("author_order", pa.int64(), nullable=False),
+        pa.field("oai_datestamp", pa.string()),
+        pa.field("metadata_hash", pa.string()),
     ]
 )
 CATEGORY_SCHEMA = pa.schema(
@@ -74,6 +79,8 @@ CATEGORY_SCHEMA = pa.schema(
         pa.field("version", pa.int64()),
         pa.field("category", pa.string(), nullable=False),
         pa.field("is_primary", pa.bool_(), nullable=False),
+        pa.field("oai_datestamp", pa.string()),
+        pa.field("metadata_hash", pa.string()),
     ]
 )
 DELETED_SCHEMA = pa.schema(
@@ -84,6 +91,12 @@ DELETED_SCHEMA = pa.schema(
         pa.field("oai_datestamp", pa.string()),
     ]
 )
+EXCLUDED_SCHEMA = pa.schema(
+    [
+        pa.field("arxiv_id", pa.string(), nullable=False),
+        pa.field("oai_datestamp", pa.string()),
+    ]
+)
 
 TABLE_SCHEMAS = {
     "paper_versions": PAPER_VERSION_SCHEMA,
@@ -91,8 +104,9 @@ TABLE_SCHEMAS = {
     "paper_authors": PAPER_AUTHOR_SCHEMA,
     "categories": CATEGORY_SCHEMA,
     "deleted_records": DELETED_SCHEMA,
+    "excluded_records": EXCLUDED_SCHEMA,
 }
-SNAPSHOT_SCHEMA_VERSION = "5"
+SNAPSHOT_SCHEMA_VERSION = "6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +117,7 @@ class SnapshotBuildResult:
     authors: int
     categories: int
     deleted_records: int
+    excluded_records: int
 
 
 class ParquetBatchStore:
@@ -174,6 +189,15 @@ class ParquetBatchStore:
             table_name: [] for table_name in TABLE_SCHEMAS
         }
         for record in records:
+            if record.excluded:
+                if record.metadata is not None:
+                    rows["excluded_records"].append(
+                        {
+                            "arxiv_id": record.metadata.arxiv_id,
+                            "oai_datestamp": record.oai_datestamp,
+                        }
+                    )
+                continue
             if record.deleted:
                 raw_id = record.oai_identifier.rsplit(":", maxsplit=1)[-1]
                 arxiv_id, version, _ = normalize_arxiv_id(raw_id)
@@ -220,7 +244,7 @@ class ParquetBatchStore:
                 )
 
             for author_order, author in enumerate(metadata.authors):
-                author_key = _author_key(author.display_name)
+                author_key = _author_key(author)
                 rows["authors"].append(
                     {
                         "author_key": author_key,
@@ -231,6 +255,7 @@ class ParquetBatchStore:
                         "affiliations_json": json.dumps(
                             list(author.affiliations), ensure_ascii=False
                         ),
+                        "name_source": author.name_source,
                     }
                 )
                 rows["paper_authors"].append(
@@ -239,6 +264,8 @@ class ParquetBatchStore:
                         "version": current_version,
                         "author_key": author_key,
                         "author_order": author_order,
+                        "oai_datestamp": record.oai_datestamp,
+                        "metadata_hash": record.metadata_hash,
                     }
                 )
             rows["categories"].extend(
@@ -247,6 +274,8 @@ class ParquetBatchStore:
                     "version": current_version,
                     "category": category.name,
                     "is_primary": category.is_primary,
+                    "oai_datestamp": record.oai_datestamp,
+                    "metadata_hash": record.metadata_hash,
                 }
                 for category in metadata.categories
             )
@@ -261,7 +290,9 @@ def _deduplicated_deletions_sql(source: str) -> str:
                 PARTITION BY arxiv_id, coalesce(version, 0), oai_datestamp
                 ORDER BY oai_identifier DESC
             ) AS dedupe_rank
-            FROM {source}
+            FROM {source} AS deletions
+            WHERE EXISTS (SELECT 1 FROM paper_versions versions
+                          WHERE versions.arxiv_id = deletions.arxiv_id)
         )
         WHERE dedupe_rank = 1
     """
@@ -270,7 +301,7 @@ def _deduplicated_deletions_sql(source: str) -> str:
 def _current_papers_sql(extra_condition: str | None = None) -> str:
     changed_filter = f"AND {extra_condition}" if extra_condition else ""
     return f"""
-        SELECT * EXCLUDE (current_rank)
+        SELECT * EXCLUDE (current_rank), lower(doi) AS doi_normalized
         FROM (
             SELECT versions.*, row_number() OVER (
                 PARTITION BY arxiv_id
@@ -290,8 +321,49 @@ def _current_papers_sql(extra_condition: str | None = None) -> str:
                         OR deleted.oai_datestamp >= versions.oai_datestamp
                     )
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM excluded_records AS excluded
+                  WHERE excluded.arxiv_id = versions.arxiv_id
+                    AND (
+                        excluded.oai_datestamp IS NULL
+                        OR versions.oai_datestamp IS NULL
+                        OR excluded.oai_datestamp >= versions.oai_datestamp
+                    )
+              )
         )
         WHERE current_rank = 1
+    """
+
+
+def _delta_winners_sql() -> str:
+    # Relationship rows must come from the same OAI record as the selected version.
+    return """
+        SELECT DISTINCT selected.arxiv_id, selected.version,
+               selected.oai_datestamp, selected.metadata_hash
+        FROM paper_versions selected
+        JOIN delta_paper_versions delta
+          ON selected.arxiv_id = delta.arxiv_id
+         AND selected.version IS NOT DISTINCT FROM delta.version
+         AND selected.oai_datestamp IS NOT DISTINCT FROM delta.oai_datestamp
+         AND selected.metadata_hash IS NOT DISTINCT FROM delta.metadata_hash
+        WHERE delta.is_current AND delta.title IS NOT NULL
+    """
+
+
+def _delta_relationship_rows_sql(table: str) -> str:
+    columns = {
+        "paper_authors": ("arxiv_id", "version", "author_key", "author_order"),
+        "categories": ("arxiv_id", "version", "category", "is_primary"),
+    }[table]
+    selected = ", ".join(f"delta.{column}" for column in columns)
+    return f"""
+        SELECT DISTINCT {selected}
+        FROM delta_{table} delta
+        JOIN delta_winners winner
+          ON delta.arxiv_id = winner.arxiv_id
+         AND delta.version IS NOT DISTINCT FROM winner.version
+         AND delta.oai_datestamp IS NOT DISTINCT FROM winner.oai_datestamp
+         AND delta.metadata_hash IS NOT DISTINCT FROM winner.metadata_hash
     """
 
 
@@ -307,7 +379,8 @@ def _paper_details_sql(*, changed_only: bool = False) -> str:
                        keyname := a.keyname,
                        forenames := a.forenames,
                        suffix := a.suffix,
-                       affiliations_json := a.affiliations_json,
+                       affiliations := CAST(a.affiliations_json AS JSON),
+                       name_source := a.name_source,
                        author_order := pa.author_order
                    ) ORDER BY pa.author_order)) AS authors_json
             FROM paper_authors pa
@@ -398,6 +471,7 @@ class DuckDBSnapshotBuilder:
                 "authors",
                 "categories",
                 "deleted_records",
+                "excluded_records",
             )
         }
         return SnapshotBuildResult(path=output_path, **counts)
@@ -420,6 +494,8 @@ class DuckDBSnapshotBuilder:
             _clone_database(Path(base_snapshot), temporary_path)
             connection = duckdb.connect(str(temporary_path))
             self.runtime.configure(connection, role="build")
+            with suppress(duckdb.Error):
+                connection.execute("PRAGMA drop_fts_index('papers')")
             self._patch_tables(connection, parquet_root)
             self._rebuild_search_indexes(connection)
             self._run_query_smoke_test(connection)
@@ -441,6 +517,7 @@ class DuckDBSnapshotBuilder:
                 "authors",
                 "categories",
                 "deleted_records",
+                "excluded_records",
             )
         }
         return SnapshotBuildResult(path=output_path, **counts)
@@ -453,17 +530,28 @@ class DuckDBSnapshotBuilder:
 
         root = Path(parquet_root)
         with duckdb.connect(":memory:") as connection:
+            connection.execute(
+                f"ATTACH '{_read_parquet_sql(Path(base_snapshot))}' "
+                "AS base_snapshot (READ_ONLY)"
+            )
             changed_row = connection.execute(
                 """
                 SELECT count(*) FROM (
                     SELECT DISTINCT arxiv_id FROM read_parquet(?)
                     UNION
-                    SELECT DISTINCT arxiv_id FROM read_parquet(?)
+                    SELECT DISTINCT deleted.arxiv_id FROM read_parquet(?) deleted
+                    WHERE EXISTS (SELECT 1 FROM base_snapshot.paper_versions versions
+                                  WHERE versions.arxiv_id = deleted.arxiv_id)
+                    UNION
+                    SELECT DISTINCT excluded.arxiv_id FROM read_parquet(?) excluded
+                    WHERE EXISTS (SELECT 1 FROM base_snapshot.paper_versions versions
+                                  WHERE versions.arxiv_id = excluded.arxiv_id)
                 )
                 """,
                 [
                     str(root / "paper_versions" / "*.parquet"),
                     str(root / "deleted_records" / "*.parquet"),
+                    str(root / "excluded_records" / "*.parquet"),
                 ],
             ).fetchone()
             changed = int(changed_row[0]) if changed_row is not None else 0
@@ -488,7 +576,7 @@ class DuckDBSnapshotBuilder:
 
     @staticmethod
     def validate_base_snapshot(snapshot_path: Path | str) -> None:
-        """Reject snapshots from the pre-``arXivRaw`` schema."""
+        """Require the current metadata schema for incremental updates."""
 
         try:
             with duckdb.connect(str(snapshot_path), read_only=True) as connection:
@@ -500,9 +588,9 @@ class DuckDBSnapshotBuilder:
                 "base snapshot is not compatible with the version-history schema; "
                 "run a new full sync in a new data directory"
             ) from error
-        if row is None or str(row[0]) not in {"2", "3", "4", SNAPSHOT_SCHEMA_VERSION}:
+        if row is None or str(row[0]) != SNAPSHOT_SCHEMA_VERSION:
             raise RuntimeError(
-                "base snapshot uses an older schema without arXivRaw version history; "
+                "base snapshot uses an incompatible metadata schema; "
                 "run a new full sync in a new data directory"
             )
 
@@ -517,12 +605,14 @@ class DuckDBSnapshotBuilder:
         paper_authors = _read_parquet_sql(root / "paper_authors" / "*.parquet")
         categories = _read_parquet_sql(root / "categories" / "*.parquet")
         deleted = _read_parquet_sql(root / "deleted_records" / "*.parquet")
+        excluded = _read_parquet_sql(root / "excluded_records" / "*.parquet")
 
         self._create_source_views(
             connection,
             {
                 "paper_versions": paper_versions,
                 "deleted_records": deleted,
+                "excluded_records": excluded,
                 "authors": authors,
                 "paper_authors": paper_authors,
                 "categories": categories,
@@ -543,19 +633,31 @@ class DuckDBSnapshotBuilder:
         for table_name in (
             "paper_versions",
             "deleted_records",
-            "paper_authors",
-            "categories",
+            "excluded_records",
         ):
             current = f"SELECT * FROM read_parquet('{parquet_paths[table_name]}')"
+            connection.execute(f"CREATE TEMP VIEW delta_{table_name} AS {current}")
             if base_snapshot is not None:
-                current = (
-                    f"SELECT * FROM base_snapshot.{table_name} UNION ALL {current}"
-                )
+                if table_name == "paper_versions":
+                    current = (
+                        "SELECT *, 0 AS source_priority FROM base_snapshot.paper_versions "
+                        f"UNION ALL SELECT *, 1 AS source_priority FROM delta_{table_name}"
+                    )
+                else:
+                    current = f"SELECT * FROM base_snapshot.{table_name} UNION ALL {current}"
+            elif table_name == "paper_versions":
+                current = f"SELECT *, 1 AS source_priority FROM delta_{table_name}"
             connection.execute(f"CREATE TEMP VIEW source_{table_name} AS {current}")
+
+        for table_name in ("paper_authors", "categories"):
+            connection.execute(
+                f"CREATE TEMP VIEW delta_{table_name} AS "
+                f"SELECT * FROM read_parquet('{parquet_paths[table_name]}')"
+            )
 
         current_authors = f"""
             SELECT author_key, keyname, forenames, suffix, display_name,
-                   affiliations_json,
+                   affiliations_json, name_source,
                    lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
                        AS display_name_normalized
             FROM read_parquet('{parquet_paths["authors"]}')
@@ -563,7 +665,7 @@ class DuckDBSnapshotBuilder:
         if base_snapshot is not None:
             current_authors = f"""
                 SELECT author_key, keyname, forenames, suffix, display_name,
-                       affiliations_json,
+                       affiliations_json, name_source,
                        lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
                            AS display_name_normalized
                 FROM base_snapshot.authors
@@ -575,11 +677,13 @@ class DuckDBSnapshotBuilder:
         connection.execute(
             """
             CREATE TABLE paper_versions AS
-            SELECT * EXCLUDE (dedupe_rank)
+            SELECT * EXCLUDE (dedupe_rank, source_priority)
             FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY arxiv_id, COALESCE(version, 0)
-                    ORDER BY oai_datestamp DESC NULLS LAST, oai_identifier DESC
+                    ORDER BY oai_datestamp DESC NULLS LAST,
+                             source_priority DESC, metadata_hash DESC NULLS LAST,
+                             oai_identifier DESC
                 ) AS dedupe_rank
                 FROM source_paper_versions
             )
@@ -590,24 +694,52 @@ class DuckDBSnapshotBuilder:
             "CREATE TABLE deleted_records AS "
             + _deduplicated_deletions_sql("source_deleted_records")
         )
+        connection.execute(
+            "CREATE TABLE excluded_records AS "
+            "SELECT arxiv_id, max(oai_datestamp) AS oai_datestamp "
+            "FROM source_excluded_records excluded "
+            "WHERE EXISTS (SELECT 1 FROM paper_versions versions "
+            "WHERE versions.arxiv_id = excluded.arxiv_id) "
+            "GROUP BY arxiv_id"
+        )
+        connection.execute(
+            "DELETE FROM excluded_records WHERE EXISTS ("
+            "SELECT 1 FROM delta_paper_versions d "
+            "WHERE d.arxiv_id = excluded_records.arxiv_id AND d.is_current "
+            "AND d.oai_datestamp >= excluded_records.oai_datestamp)"
+        )
         connection.execute("CREATE TABLE papers AS " + _current_papers_sql())
+        connection.execute("CREATE TEMP TABLE delta_winners AS " + _delta_winners_sql())
         connection.execute(
             """
             CREATE TABLE authors AS
             SELECT DISTINCT * FROM source_authors
             """
         )
+        for table_name in ("paper_authors", "categories"):
+            delta_rows = _delta_relationship_rows_sql(table_name)
+            if base_snapshot is not None:
+                source = f"""
+                    SELECT base.* FROM base_snapshot.{table_name} base
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM delta_winners winner
+                        WHERE winner.arxiv_id = base.arxiv_id
+                          AND winner.version IS NOT DISTINCT FROM base.version
+                    )
+                    UNION ALL {delta_rows}
+                """
+            else:
+                source = delta_rows
+            connection.execute(
+                f"CREATE TABLE {table_name} AS "
+                f"SELECT DISTINCT * FROM ({source}) relationships "
+                "WHERE EXISTS (SELECT 1 FROM papers "
+                "WHERE papers.arxiv_id = relationships.arxiv_id)"
+            )
         connection.execute(
-            """
-            CREATE TABLE paper_authors AS
-            SELECT DISTINCT * FROM source_paper_authors
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE categories AS
-            SELECT DISTINCT * FROM source_categories
-            """
+            "DELETE FROM authors WHERE NOT EXISTS ("
+            "SELECT 1 FROM paper_authors pa "
+            "WHERE pa.author_key = authors.author_key)"
         )
         connection.execute(
             """
@@ -622,15 +754,10 @@ class DuckDBSnapshotBuilder:
         )
         for table, column in (
             ("papers", "arxiv_id"),
-            ("papers", "doi"),
-            ("papers", "created"),
-            ("papers", "updated"),
+            ("papers", "doi_normalized"),
             ("paper_versions", "arxiv_id"),
-            ("paper_versions", "version"),
             ("authors", "author_key"),
-            ("authors", "display_name_normalized"),
             ("paper_authors", "arxiv_id"),
-            ("paper_authors", "author_key"),
             ("categories", "category"),
             ("categories", "arxiv_id"),
         ):
@@ -647,7 +774,7 @@ class DuckDBSnapshotBuilder:
         )
 
     def _build_search_indexes(self, connection: duckdb.DuckDBPyConnection) -> None:
-        """Build structural search data and use DuckDB FTS when available."""
+        """Build full-text search directly from the current-paper table."""
 
         connection.execute(
             """
@@ -655,24 +782,6 @@ class DuckDBSnapshotBuilder:
             SELECT * FROM papers
             """
         )
-        connection.execute(
-            """
-            CREATE TABLE paper_search AS
-            SELECT
-                arxiv_id,
-                concat_ws(' ',
-                    coalesce(title, ''),
-                    coalesce(abstract, ''),
-                    coalesce(comments, ''),
-                    coalesce(journal_ref, '')
-                ) AS search_text
-            FROM papers
-            """
-        )
-        connection.execute(
-            "CREATE INDEX idx_paper_search_arxiv_id ON paper_search (arxiv_id)"
-        )
-
         try:
             try:
                 connection.execute("LOAD fts")
@@ -682,7 +791,8 @@ class DuckDBSnapshotBuilder:
             connection.execute(
                 """
                 PRAGMA create_fts_index(
-                    'paper_search', 'arxiv_id', 'search_text',
+                    'papers', 'arxiv_id', 'title', 'abstract',
+                    'comments', 'journal_ref',
                     stemmer='porter', stopwords='english', lower=1,
                     strip_accents=1, overwrite=1
                 )
@@ -711,9 +821,8 @@ class DuckDBSnapshotBuilder:
         """Refresh search tables after an incremental table patch."""
 
         with suppress(duckdb.Error):
-            connection.execute("PRAGMA drop_fts_index('paper_search')")
+            connection.execute("PRAGMA drop_fts_index('papers')")
         connection.execute("DROP VIEW IF EXISTS current_papers")
-        connection.execute("DROP TABLE IF EXISTS paper_search")
         connection.execute("DROP TABLE IF EXISTS search_metadata")
         self._build_search_indexes(connection)
 
@@ -734,24 +843,38 @@ class DuckDBSnapshotBuilder:
             CREATE OR REPLACE TEMP TABLE changed_ids AS
             SELECT DISTINCT arxiv_id FROM delta_paper_versions
             UNION
-            SELECT DISTINCT arxiv_id FROM delta_deleted_records
+            SELECT DISTINCT deleted.arxiv_id FROM delta_deleted_records deleted
+            WHERE EXISTS (SELECT 1 FROM paper_versions versions
+                          WHERE versions.arxiv_id = deleted.arxiv_id)
+            UNION
+            SELECT DISTINCT excluded.arxiv_id FROM delta_excluded_records excluded
+            WHERE EXISTS (SELECT 1 FROM paper_versions versions
+                          WHERE versions.arxiv_id = excluded.arxiv_id)
             """
+        )
+        connection.execute(
+            "CREATE OR REPLACE TEMP TABLE old_author_keys AS "
+            "SELECT DISTINCT author_key FROM paper_authors "
+            "WHERE arxiv_id IN (SELECT arxiv_id FROM changed_ids)"
         )
         connection.execute(
             """
             CREATE OR REPLACE TEMP TABLE merged_paper_versions AS
-            SELECT * EXCLUDE (dedupe_rank)
+            SELECT * EXCLUDE (dedupe_rank, source_priority)
             FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY arxiv_id, coalesce(version, 0)
-                    ORDER BY oai_datestamp DESC NULLS LAST, oai_identifier DESC
+                    ORDER BY oai_datestamp DESC NULLS LAST,
+                             source_priority DESC, metadata_hash DESC NULLS LAST,
+                             oai_identifier DESC
                 ) AS dedupe_rank
                 FROM (
-                    SELECT versions.*
+                    SELECT versions.*, 0 AS source_priority
                     FROM paper_versions versions
                     WHERE versions.arxiv_id IN (SELECT arxiv_id FROM changed_ids)
                     UNION ALL
-                    SELECT delta.* FROM delta_paper_versions delta
+                    SELECT delta.*, 1 AS source_priority
+                    FROM delta_paper_versions delta
                 ) combined
             )
             WHERE dedupe_rank = 1
@@ -763,6 +886,9 @@ class DuckDBSnapshotBuilder:
         )
         connection.execute(
             "INSERT INTO paper_versions SELECT * FROM merged_paper_versions"
+        )
+        connection.execute(
+            "CREATE OR REPLACE TEMP TABLE delta_winners AS " + _delta_winners_sql()
         )
         connection.execute(
             "CREATE OR REPLACE TEMP TABLE merged_deleted_records AS "
@@ -780,55 +906,65 @@ class DuckDBSnapshotBuilder:
             "INSERT INTO deleted_records SELECT * FROM merged_deleted_records"
         )
         connection.execute(
-            """
-            INSERT INTO paper_authors
-            SELECT DISTINCT delta.*
-            FROM delta_paper_authors delta
-            WHERE NOT EXISTS (
-                SELECT 1 FROM paper_authors existing
-                WHERE existing.arxiv_id = delta.arxiv_id
-                  AND existing.version IS NOT DISTINCT FROM delta.version
-                  AND existing.author_key = delta.author_key
-                  AND existing.author_order = delta.author_order
-            )
-            """
+            "CREATE OR REPLACE TEMP TABLE merged_excluded_records AS "
+            "SELECT arxiv_id, max(oai_datestamp) AS oai_datestamp FROM ("
+            "SELECT base.* FROM excluded_records base "
+            "WHERE base.arxiv_id IN (SELECT arxiv_id FROM changed_ids) "
+            "UNION ALL SELECT excluded.* FROM delta_excluded_records excluded "
+            "WHERE EXISTS (SELECT 1 FROM paper_versions versions "
+            "WHERE versions.arxiv_id = excluded.arxiv_id)) "
+            "GROUP BY arxiv_id"
         )
         connection.execute(
-            """
-            INSERT INTO categories
-            SELECT DISTINCT delta.*
-            FROM delta_categories delta
-            WHERE NOT EXISTS (
-                SELECT 1 FROM categories existing
-                WHERE existing.arxiv_id = delta.arxiv_id
-                  AND existing.version IS NOT DISTINCT FROM delta.version
-                  AND existing.category = delta.category
-                  AND existing.is_primary = delta.is_primary
-            )
-            """
+            "DELETE FROM excluded_records WHERE arxiv_id IN "
+            "(SELECT arxiv_id FROM changed_ids)"
         )
+        connection.execute(
+            "INSERT INTO excluded_records SELECT * FROM merged_excluded_records"
+        )
+        connection.execute(
+            "DELETE FROM excluded_records WHERE EXISTS ("
+            "SELECT 1 FROM delta_paper_versions d "
+            "WHERE d.arxiv_id = excluded_records.arxiv_id AND d.is_current "
+            "AND d.oai_datestamp >= excluded_records.oai_datestamp)"
+        )
+        for table_name in ("paper_authors", "categories"):
+            connection.execute(
+                f"DELETE FROM {table_name} WHERE EXISTS ("
+                "SELECT 1 FROM delta_winners winner "
+                f"WHERE winner.arxiv_id = {table_name}.arxiv_id "
+                f"AND winner.version IS NOT DISTINCT FROM {table_name}.version)"
+            )
+            connection.execute(
+                f"INSERT INTO {table_name} "
+                + _delta_relationship_rows_sql(table_name)
+            )
         connection.execute(
             """
             INSERT INTO authors (
                 author_key, keyname, forenames, suffix, display_name,
-                affiliations_json, display_name_normalized
+                affiliations_json, name_source, display_name_normalized
             )
             SELECT author_key, keyname, forenames, suffix, display_name,
-                   affiliations_json, display_name_normalized
+                   affiliations_json, name_source, display_name_normalized
             FROM (
                 SELECT author_key, keyname, forenames, suffix, display_name,
-                       affiliations_json,
+                       affiliations_json, name_source,
                        lower(regexp_replace(trim(display_name), '\\s+', ' ', 'g'))
                            AS display_name_normalized,
                        row_number() OVER (
                            PARTITION BY author_key ORDER BY display_name
                        ) AS author_rank
                 FROM delta_authors
-            )
+            ) ranked
             WHERE author_rank = 1
+              AND EXISTS (
+                  SELECT 1 FROM paper_authors pa
+                  WHERE pa.author_key = ranked.author_key
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM authors existing
-                  WHERE existing.author_key = author_key
+                  WHERE existing.author_key = ranked.author_key
               )
             """
         )
@@ -840,6 +976,19 @@ class DuckDBSnapshotBuilder:
             + _current_papers_sql(
                 "arxiv_id IN (SELECT arxiv_id FROM changed_ids)"
             )
+        )
+        for table_name in ("paper_authors", "categories"):
+            connection.execute(
+                f"DELETE FROM {table_name} WHERE arxiv_id IN "
+                "(SELECT arxiv_id FROM changed_ids) AND NOT EXISTS "
+                "(SELECT 1 FROM papers "
+                f"WHERE papers.arxiv_id = {table_name}.arxiv_id)"
+            )
+        connection.execute(
+            "DELETE FROM authors WHERE NOT EXISTS ("
+            "SELECT 1 FROM paper_authors pa "
+            "WHERE pa.author_key = authors.author_key) "
+            "AND author_key IN (SELECT author_key FROM old_author_keys)"
         )
         connection.execute(
             "DELETE FROM paper_details WHERE arxiv_id IN (SELECT arxiv_id FROM changed_ids)"
@@ -876,7 +1025,7 @@ class DuckDBSnapshotBuilder:
             "categories",
             "deleted_records",
             "paper_details",
-            "paper_search",
+            "excluded_records",
             "search_metadata",
         )
         for table in required_tables:
@@ -899,8 +1048,14 @@ class DuckDBSnapshotBuilder:
             return int(row[0])
 
 
-def _author_key(display_name: str) -> str:
-    return hashlib.sha256(display_name.casefold().encode("utf-8")).hexdigest()
+def _author_key(author: ArxivAuthor) -> str:
+    canonical = json.dumps(
+        author.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _version_row(
@@ -924,6 +1079,7 @@ def _version_row(
         "license": metadata.license if is_current else None,
         "primary_category": metadata.primary_category if is_current else None,
         "authors_raw": metadata.authors_raw if is_current else None,
+        "report_numbers": list(metadata.report_numbers) if is_current else None,
         "metadata_hash": record.metadata_hash if is_current else None,
     }
     return {

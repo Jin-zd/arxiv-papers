@@ -95,6 +95,7 @@ class FullSyncResult:
                 "authors": self.snapshot.authors,
                 "categories": self.snapshot.categories,
                 "deleted_records": self.snapshot.deleted_records,
+                "excluded_records": self.snapshot.excluded_records,
             },
         }
 
@@ -446,6 +447,7 @@ class FullSyncRunner:
                 "authors": snapshot.authors,
                 "categories": snapshot.categories,
                 "deleted_records": snapshot.deleted_records,
+                "excluded_records": snapshot.excluded_records,
             },
         )
         self.state_store.mark_completed(
@@ -453,7 +455,9 @@ class FullSyncRunner:
             snapshot_path=snapshot.path,
             sync_name=sync_name,
         )
-        self.snapshot_catalog.prune()
+        self.snapshot_catalog.prune(
+            protected_paths=self.state_store.completed_snapshot_paths()
+        )
         return FullSyncResult(
             run_id=context.run_id,
             stats=stats,
@@ -474,11 +478,13 @@ class FullSyncRunner:
         checkpoint: SyncCheckpointSession,
     ) -> list[ParsedArxivRecord]:
         parsed_records: list[ParsedArxivRecord] = []
+        parse_errors = 0
         for record in page.records:
             try:
                 parsed = parse_oai_record(record)
             except MetadataParseError as error:
                 stats.parse_errors += 1
+                parse_errors += 1
                 store.write_parse_error(
                     page_number=page_number,
                     oai_identifier=record.identifier,
@@ -511,6 +517,13 @@ class FullSyncRunner:
             else:
                 stats.filtered_records += 1
                 parsed_records.pop()
+                if checkpoint.sync_name == "incremental" and not parsed.deleted:
+                    parsed_records.append(parsed.model_copy(update={"excluded": True}))
+        if parse_errors:
+            raise MetadataParseError(
+                f"page {page_number} contains {parse_errors} unparseable records; "
+                "the page was archived and remains uncheckpointed"
+            )
         return parsed_records
 
 
@@ -565,11 +578,12 @@ class IncrementalSyncRunner(FullSyncRunner):
                 min(until, safe_until) if until is not None else safe_until
             )
             effective_from = overlap_datestamp(
-                base_state.last_successful_datestamp,
+                base_state.last_scanned_until
+                or base_state.last_successful_datestamp,
                 from_,
                 overlap_days=self.overlap_days,
             )
-            effective_set = set_name or base_state.set_name
+            effective_set = set_name
             effective_prefix = metadata_prefix or base_state.metadata_prefix
             effective_created_from = (
                 created_from
@@ -585,7 +599,6 @@ class IncrementalSyncRunner(FullSyncRunner):
                 else base_state.category_prefixes or DEFAULT_CATEGORY_PREFIXES
             )
             requested_run_id = run_id or _new_run_id(prefix="incremental")
-        effective_set = effective_set or "cs"
         effective_prefix = effective_prefix or self.client.config.metadata_prefix
         scope = _build_scope(
             effective_created_from,

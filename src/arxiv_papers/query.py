@@ -59,6 +59,7 @@ _PAPER_COLUMNS = (
     "license",
     "primary_category",
     "authors_raw",
+    "report_numbers",
     "oai_identifier",
     "oai_datestamp",
     "metadata_hash",
@@ -97,6 +98,9 @@ class DuckDBQueryService:
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
+        self._has_report_numbers = self._has_column("papers", "report_numbers")
+        self._has_normalized_doi = self._has_column("papers", "doi_normalized")
+        self._fts_table = "paper_search" if self._has_table("paper_search") else "papers"
         if not self._has_table("paper_details"):
             self.connection.close()
             raise QueryError(
@@ -174,15 +178,16 @@ class DuckDBQueryService:
         from_sql = "papers p"
         search_cte = ""
         if normalized_query and self.fts_enabled:
-            search_cte = """
+            fts_function = f"fts_main_{self._fts_table}.match_bm25"
+            search_cte = f"""
                 search_candidates AS (
                     SELECT arxiv_id, relevance
                     FROM (
                         SELECT arxiv_id,
-                               fts_main_paper_search.match_bm25(
+                               {fts_function}(
                                    arxiv_id, ?
                                ) AS relevance
-                        FROM paper_search
+                        FROM {self._fts_table}
                     ) candidates
                     WHERE relevance IS NOT NULL
                 ),
@@ -300,8 +305,13 @@ class DuckDBQueryService:
         if any(not item for item in canonical_ids):
             raise QueryError("arxiv_ids must not contain empty values")
 
-        placeholders = ", ".join("?" for _ in canonical_ids)
-        select_columns = ", ".join(f"p.{column}" for column in _PAPER_COLUMNS)
+        unique_ids = tuple(dict.fromkeys(canonical_ids))
+        placeholders = ", ".join("?" for _ in unique_ids)
+        select_columns = ", ".join(
+            "NULL AS report_numbers" if column == "report_numbers" and not self._has_report_numbers
+            else f"p.{column}"
+            for column in _PAPER_COLUMNS
+        )
         rows = self.connection.execute(
             f"""
             SELECT {select_columns}, d.authors_json, d.categories_json,
@@ -310,7 +320,7 @@ class DuckDBQueryService:
             LEFT JOIN paper_details d ON d.arxiv_id = p.arxiv_id
             WHERE p.arxiv_id IN ({placeholders})
             """,
-            list(dict.fromkeys(canonical_ids)),
+            list(unique_ids),
         ).fetchall()
         papers = {
             str(row[0]): self._paper_from_details_row(row, version=version)
@@ -351,8 +361,9 @@ class DuckDBQueryService:
         normalized_doi = doi.strip()
         if not normalized_doi:
             raise QueryError("doi must not be empty")
+        doi_column = "doi_normalized" if self._has_normalized_doi else "lower(doi)"
         row = self.connection.execute(
-            "SELECT arxiv_id FROM papers WHERE lower(doi) = lower(?) LIMIT 1",
+            f"SELECT arxiv_id FROM papers WHERE {doi_column} = lower(?) LIMIT 1",
             [normalized_doi],
         ).fetchone()
         if row is None:
