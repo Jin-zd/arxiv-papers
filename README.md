@@ -54,7 +54,7 @@ uv run arxiv-papers --help
 
 ```bash
 uv run arxiv-papers sync full \
-  --data-dir data-cs-2023-rebuilt
+  --data-dir data-cs-2023
 ```
 
 默认会显示 `tqdm` 进度条。同步完成后会输出 JSON 结果，并生成当前查询快照。
@@ -63,7 +63,7 @@ uv run arxiv-papers sync full \
 
 ```bash
 uv run arxiv-papers sync full \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --proxy http://127.0.0.1:7890
 ```
 
@@ -75,7 +75,7 @@ uv run arxiv-papers sync full \
 
 ```bash
 uv run arxiv-papers sync full \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --no-progress
 ```
 
@@ -83,8 +83,8 @@ uv run arxiv-papers sync full \
 
 ```bash
 uv run arxiv-papers sync full \
-  --data-dir data-cs-2023-rebuilt \
-  --log-file data-cs-2023-rebuilt/logs/full.jsonl
+  --data-dir data-cs-2023 \
+  --log-file data-cs-2023/logs/full.jsonl
 ```
 
 ## 增量同步
@@ -93,7 +93,7 @@ uv run arxiv-papers sync full \
 
 ```bash
 uv run arxiv-papers sync incremental \
-  --data-dir data-cs-2023-rebuilt
+  --data-dir data-cs-2023
 ```
 
 增量同步会根据上一次成功扫描的时间点计算起始日期，并保留少量重叠时间，避免遗漏边界记录。默认不限制 OAI set，以便发现论文退出本地 `cs.` 范围的变化；本地创建日期和分类过滤仍然生效。
@@ -102,7 +102,7 @@ uv run arxiv-papers sync incremental \
 
 ```bash
 uv run arxiv-papers sync incremental \
-  --data-dir data-cs-2023-rebuilt
+  --data-dir data-cs-2023
 ```
 
 常用参数：
@@ -110,17 +110,17 @@ uv run arxiv-papers sync incremental \
 ```bash
 # 覆盖同步起始日期
 uv run arxiv-papers sync incremental \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --from 2026-09-01
 
 # 覆盖本地分类过滤
 uv run arxiv-papers sync incremental \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --category-prefix cs.AI
 
 # 指定 OAI set。缩小 set 可能看不到退出该 set 的论文变化
 uv run arxiv-papers sync incremental \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --set cs
 ```
 
@@ -128,20 +128,20 @@ uv run arxiv-papers sync incremental \
 
 ```bash
 # 查看同步状态、checkpoint 和批次
-uv run arxiv-papers sync status --data-dir data-cs-2023-rebuilt
+uv run arxiv-papers sync status --data-dir data-cs-2023
 
 # 验证全量同步
 uv run arxiv-papers sync verify \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --sync-name full
 
 # 检查同步和当前快照
 uv run arxiv-papers ops health \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --sync-name full
 
 # 检查 Parquet 文件和快照完整性
-uv run arxiv-papers ops integrity --data-dir data-cs-2023-rebuilt
+uv run arxiv-papers ops integrity --data-dir data-cs-2023
 ```
 
 ## MCP 配置
@@ -152,14 +152,14 @@ uv run arxiv-papers ops integrity --data-dir data-cs-2023-rebuilt
 
 ```bash
 uv run arxiv-papers mcp \
-  --data-dir data-cs-2023-rebuilt
+  --data-dir data-cs-2023
 ```
 
 默认读取数据目录中的当前快照指针。也可以固定到一个具体快照：
 
 ```bash
 uv run arxiv-papers mcp \
-  --snapshot data-cs-2023-rebuilt/duckdb/library-full-<run-id>.duckdb
+  --snapshot data-cs-2023/duckdb/library-full-<run-id>.duckdb
 ```
 
 ### Claude Desktop 配置
@@ -178,7 +178,7 @@ uv run arxiv-papers mcp \
         "arxiv-papers",
         "mcp",
         "--data-dir",
-        "/绝对路径/arxiv papers/data-cs-2023-rebuilt"
+        "/绝对路径/arxiv papers/data-cs-2023"
       ]
     }
   }
@@ -197,7 +197,7 @@ uv run arxiv-papers mcp \
       "args": [
         "mcp",
         "--data-dir",
-        "/绝对路径/arxiv papers/data-cs-2023-rebuilt"
+        "/绝对路径/arxiv papers/data-cs-2023"
       ]
     }
   }
@@ -218,7 +218,7 @@ uv run arxiv-papers mcp \
 ## 数据目录结构
 
 ```text
-data-cs-2023-rebuilt/
+data-cs-2023/
 ├── duckdb/
 │   ├── current.json                 # 当前快照指针
 │   └── library-<run-id>.duckdb      # 不可变查询快照
@@ -237,7 +237,7 @@ data-cs-2023-rebuilt/
 ```python
 from arxiv_papers.query import DuckDBQueryService
 
-snapshot = "data-cs-2023-rebuilt/duckdb/library-<run-id>.duckdb"
+snapshot = "data-cs-2023/duckdb/library-<run-id>.duckdb"
 
 with DuckDBQueryService(snapshot) as query:
     page = query.search_papers(
@@ -258,7 +258,7 @@ with DuckDBQueryService(snapshot) as query:
 
 ```bash
 uv run arxiv-papers ops backup \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --output-dir backups
 ```
 
@@ -266,7 +266,7 @@ uv run arxiv-papers ops backup \
 
 ```bash
 uv run arxiv-papers ops backup \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --output-dir backups \
   --include-raw
 ```
@@ -275,7 +275,7 @@ uv run arxiv-papers ops backup \
 
 ```bash
 uv run arxiv-papers ops schedule \
-  --data-dir data-cs-2023-rebuilt \
+  --data-dir data-cs-2023 \
   --hour 2 \
   --minute 0
 ```
