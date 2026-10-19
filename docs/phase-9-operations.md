@@ -7,11 +7,14 @@ MCP 进程中启动常驻线程。
 ## 本地查询运行参数
 
 MCP 查询连接默认使用 2 个 DuckDB worker、最多 8 个连接，每连接内存上限为
-`1536MB`，临时文件写入 `/tmp/arxiv-papers-duckdb`。可通过环境变量调整：
+`1536MB`，临时文件写入 `/tmp/arxiv-papers-duckdb`。DuckDB 扩展独立存放在
+`~/.duckdb/extensions`，不随临时目录变化。构建和查询进程使用相同扩展目录；查询只加载
+已有扩展，不会联网安装。可通过环境变量调整：
 
 - `ARXIV_DUCKDB_QUERY_THREADS` / `ARXIV_DUCKDB_BUILD_THREADS`
 - `ARXIV_DUCKDB_QUERY_MEMORY` / `ARXIV_DUCKDB_BUILD_MEMORY`
-- `ARXIV_DUCKDB_TEMP_DIR`
+- `ARXIV_DUCKDB_TEMP_DIR`：DuckDB 临时文件目录
+- `ARXIV_DUCKDB_EXTENSION_DIR`：DuckDB 扩展目录，默认 `~/.duckdb/extensions`
 - `ARXIV_MCP_MAX_CONNECTIONS` / `ARXIV_MCP_POOL_TIMEOUT`
 - `ARXIV_MCP_PAPER_CACHE_BYTES` / `ARXIV_MCP_SEARCH_CACHE_SIZE`
 - `ARXIV_SYNC_CHECKPOINT_PAGES` / `ARXIV_SYNC_CHECKPOINT_RECORDS`

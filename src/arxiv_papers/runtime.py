@@ -53,16 +53,20 @@ class DuckDBRuntimeConfig:
     checkpoint_pages: int = 10
     checkpoint_records: int = 50_000
     checkpoint_bytes: int = 256 * 1024 * 1024
+    extension_directory: Path | None = Path.home() / ".duckdb" / "extensions"
 
     @classmethod
     def from_environment(cls) -> DuckDBRuntimeConfig:
+        extension = os.environ.get(
+            "ARXIV_DUCKDB_EXTENSION_DIR",
+            str(Path.home() / ".duckdb" / "extensions"),
+        )
         temp = os.environ.get("ARXIV_DUCKDB_TEMP_DIR", "/tmp/arxiv-papers-duckdb")
         return cls(
+            extension_directory=Path(extension).expanduser() if extension else None,
             query_threads=_env_int("ARXIV_DUCKDB_QUERY_THREADS", 2),
             build_threads=_env_int("ARXIV_DUCKDB_BUILD_THREADS", 10),
-            query_memory_limit=os.environ.get(
-                "ARXIV_DUCKDB_QUERY_MEMORY", "1536MB"
-            ),
+            query_memory_limit=os.environ.get("ARXIV_DUCKDB_QUERY_MEMORY", "1536MB"),
             build_memory_limit=os.environ.get("ARXIV_DUCKDB_BUILD_MEMORY", "12GB"),
             temp_directory=Path(temp).expanduser() if temp else None,
             max_connections=_env_int("ARXIV_MCP_MAX_CONNECTIONS", 8),
@@ -71,15 +75,11 @@ class DuckDBRuntimeConfig:
             paper_cache_bytes=_env_int(
                 "ARXIV_MCP_PAPER_CACHE_BYTES", 128 * 1024 * 1024, minimum=0
             ),
-            search_cache_size=_env_int(
-                "ARXIV_MCP_SEARCH_CACHE_SIZE", 256, minimum=0
-            ),
+            search_cache_size=_env_int("ARXIV_MCP_SEARCH_CACHE_SIZE", 256, minimum=0),
             search_cache_ttl_seconds=_env_float("ARXIV_MCP_SEARCH_CACHE_TTL", 5.0),
             checkpoint_pages=_env_int("ARXIV_SYNC_CHECKPOINT_PAGES", 10),
             checkpoint_records=_env_int("ARXIV_SYNC_CHECKPOINT_RECORDS", 50_000),
-            checkpoint_bytes=_env_int(
-                "ARXIV_SYNC_CHECKPOINT_BYTES", 256 * 1024 * 1024
-            ),
+            checkpoint_bytes=_env_int("ARXIV_SYNC_CHECKPOINT_BYTES", 256 * 1024 * 1024),
         )
 
     def configure(
@@ -95,16 +95,15 @@ class DuckDBRuntimeConfig:
         if threads < 1:
             raise ValueError("DuckDB thread count must be positive")
         connection.execute(f"SET threads TO {int(threads)}")
-        connection.execute(
-            "SET memory_limit TO " + _quote_setting(memory)
-        )
+        connection.execute("SET memory_limit TO " + _quote_setting(memory))
         connection.execute("SET preserve_insertion_order TO false")
+        if self.extension_directory is not None:
+            connection.execute(
+                "SET extension_directory TO "
+                + _quote_setting(str(self.extension_directory.expanduser().resolve()))
+            )
         if self.temp_directory is not None:
             self.temp_directory.mkdir(parents=True, exist_ok=True)
-            connection.execute(
-                "SET home_directory TO "
-                + _quote_setting(str(self.temp_directory.resolve()))
-            )
             connection.execute(
                 "SET temp_directory TO "
                 + _quote_setting(str(self.temp_directory.resolve()))

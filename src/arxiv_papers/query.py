@@ -91,16 +91,24 @@ class DuckDBQueryService:
                 self.connection.execute("LOAD fts")
             except duckdb.Error as error:
                 self.connection.close()
+                extension_directory = (
+                    str(runtime.extension_directory.expanduser().resolve())
+                    if runtime.extension_directory is not None
+                    else "DuckDB's default extension directory"
+                )
                 raise QueryError(
-                    "snapshot requires the DuckDB FTS extension; "
-                    "install the matching extension before querying"
+                    "snapshot requires the DuckDB FTS extension, but it could not "
+                    f"be loaded from {extension_directory}; install the matching "
+                    "extension there or set ARXIV_DUCKDB_EXTENSION_DIR"
                 ) from error
         self._authors_have_normalized_name = self._has_column(
             "authors", "display_name_normalized"
         )
         self._has_report_numbers = self._has_column("papers", "report_numbers")
         self._has_normalized_doi = self._has_column("papers", "doi_normalized")
-        self._fts_table = "paper_search" if self._has_table("paper_search") else "papers"
+        self._fts_table = (
+            "paper_search" if self._has_table("paper_search") else "papers"
+        )
         if not self._has_table("paper_details"):
             self.connection.close()
             raise QueryError(
@@ -308,7 +316,8 @@ class DuckDBQueryService:
         unique_ids = tuple(dict.fromkeys(canonical_ids))
         placeholders = ", ".join("?" for _ in unique_ids)
         select_columns = ", ".join(
-            "NULL AS report_numbers" if column == "report_numbers" and not self._has_report_numbers
+            "NULL AS report_numbers"
+            if column == "report_numbers" and not self._has_report_numbers
             else f"p.{column}"
             for column in _PAPER_COLUMNS
         )
@@ -326,7 +335,9 @@ class DuckDBQueryService:
             str(row[0]): self._paper_from_details_row(row, version=version)
             for row in rows
         }
-        return {arxiv_id: papers.get(arxiv_id) for arxiv_id in dict.fromkeys(canonical_ids)}
+        return {
+            arxiv_id: papers.get(arxiv_id) for arxiv_id in dict.fromkeys(canonical_ids)
+        }
 
     def _paper_from_details_row(
         self, row: Sequence[object], *, version: int | None
@@ -465,7 +476,9 @@ def _structured_filters(
         )
         parameters.append(f"%{_normalize_search_text(author)}%")
     if category:
-        category_match = "c.category LIKE ?" if category.endswith(".") else "c.category = ?"
+        category_match = (
+            "c.category LIKE ?" if category.endswith(".") else "c.category = ?"
+        )
         conditions.append(
             "EXISTS (SELECT 1 FROM categories c "
             "WHERE c.arxiv_id = p.arxiv_id "
@@ -511,7 +524,9 @@ def _json_list(value: object) -> list[dict[str, object]]:
         parsed = json.loads(str(value))
     except (TypeError, json.JSONDecodeError) as error:
         raise QueryError("snapshot contains invalid paper detail JSON") from error
-    if not isinstance(parsed, list) or any(not isinstance(item, dict) for item in parsed):
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, dict) for item in parsed
+    ):
         raise QueryError("snapshot contains invalid paper detail JSON")
     return [dict(item) for item in parsed]
 
