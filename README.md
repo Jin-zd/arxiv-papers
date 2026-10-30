@@ -162,47 +162,34 @@ uv run arxiv-papers mcp \
   --snapshot data-cs-2023/duckdb/library-full-<run-id>.duckdb
 ```
 
-### Claude Desktop 配置
+### Codex Desktop 配置
+在 config.toml 中加入：
+```toml
+[mcp_servers.arxiv_local]
+command = "绝对路径/uv"
+args = [
+  "run",
+  "arxiv-papers",
+  "mcp",
+  "--data-dir",
+  "绝对路径/arxiv papers/data-cs-2023",
+]
+cwd = "绝对路径/arxiv papers"
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+enabled = true
 
-打开 Claude Desktop 的配置文件，在 `mcpServers` 中加入：
-
-```json
-{
-  "mcpServers": {
-    "arxiv-papers": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/绝对路径/arxiv papers",
-        "arxiv-papers",
-        "mcp",
-        "--data-dir",
-        "/绝对路径/arxiv papers/data-cs-2023"
-      ]
-    }
-  }
-}
+enabled_tools = [
+  "search_papers",
+  "get_paper",
+  "search_by_author",
+  "search_by_category",
+  "library_status",
+]
 ```
 
-把示例中的两个路径替换为本机绝对路径，然后重启 MCP 客户端。
+如果不使用 uv，可以更改 `command` 为 Python 解释器路径，并在 `args` 中加入 `-m arxiv_papers mcp --data-dir ...`。
 
-如果不想依赖 `uv` 的工作目录，也可以直接调用虚拟环境中的脚本：
-
-```json
-{
-  "mcpServers": {
-    "arxiv-papers": {
-      "command": "/绝对路径/arxiv papers/.venv/bin/arxiv-papers",
-      "args": [
-        "mcp",
-        "--data-dir",
-        "/绝对路径/arxiv papers/data-cs-2023"
-      ]
-    }
-  }
-}
-```
 
 ### MCP 提供的工具
 
